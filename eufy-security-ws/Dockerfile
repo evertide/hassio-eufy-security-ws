@@ -13,6 +13,10 @@ RUN \
     && npm install --force \
     "eufy-security-ws@${EUFY_SECURITY_WS_VERSION}"
 
+# Apply P2P session.js patch for malformed packet handling
+COPY patch-eufy-client.sh /tmp/
+RUN /tmp/patch-eufy-client.sh && rm /tmp/patch-eufy-client.sh
+
 COPY run.sh /
 RUN chmod a+x /run.sh
 WORKDIR /data

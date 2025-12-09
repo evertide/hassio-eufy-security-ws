@@ -12,38 +12,55 @@ fi
 # Create backup
 cp "$SESSION_FILE" "$SESSION_FILE.bak"
 
+# Find the correct logger reference in the compiled file
+LOGGER_REF=$(grep -o 'logging_1\|rootP2PLogger' "$SESSION_FILE" | head -1)
+if [ -z "$LOGGER_REF" ]; then
+    echo "ERROR: Could not find logger reference"
+    mv "$SESSION_FILE.bak" "$SESSION_FILE"
+    exit 1
+fi
+
+# If it's the CommonJS module pattern, use logging_1.rootP2PLogger
+if [ "$LOGGER_REF" = "logging_1" ]; then
+    LOGGER="logging_1.rootP2PLogger"
+else
+    LOGGER="rootP2PLogger"
+fi
+
+echo "Using logger reference: $LOGGER"
+
 # Apply the malformed packet fix
-sed -i '/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAGIC_WORD;/a\
-                \/\/ Check for malformed initial packets (before processing starts)\
-                if (!firstPartMessage \&\& this.currentMessageBuilder[message.type].header.bytesToRead === 0) {\
-                    rootP2PLogger.info("Discarding malformed P2P packet", {\
-                        stationSN: this.rawStation.station_sn,\
-                        seqNo: message.seqNo,\
-                        dataType: P2PDataType[message.type],\
-                        first4Bytes: data.subarray(0, 4).toString("hex"),\
-                        dataLength: data.length\
-                    });\
-                    data = Buffer.from([]);\
-                    this.currentMessageState[message.type].leftoverData = Buffer.from([]);\
-                    break;\
-                }' "$SESSION_FILE"
+sed -i "/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAGIC_WORD;/a\\
+                \/\/ Check for malformed initial packets (before processing starts)\\
+                if (!firstPartMessage \&\& this.currentMessageBuilder[message.type].header.bytesToRead === 0) {\\
+                    ${LOGGER}.info(\"Discarding malformed P2P packet\", {\\
+                        stationSN: this.rawStation.station_sn,\\
+                        seqNo: message.seqNo,\\
+                        dataType: P2PDataType[message.type],\\
+                        first4Bytes: data.subarray(0, 4).toString(\"hex\"),\\
+                        dataLength: data.length\\
+                    });\\
+                    data = Buffer.from([]);\\
+                    this.currentMessageState[message.type].leftoverData = Buffer.from([]);\\
+                    break;\\
+                }" "$SESSION_FILE"
 
 # Add diagnostic logging for connection close events
-sed -i '/onClose() {/a\
-        rootP2PLogger.info("P2P connection closed", {\
-            stationSN: this.rawStation.station_sn,\
-            wasStreaming: this.isCurrentlyStreaming()\
-        });' "$SESSION_FILE"
+sed -i "/onClose() {/a\\
+        ${LOGGER}.info(\"P2P connection closed\", {\\
+            stationSN: this.rawStation.station_sn,\\
+            wasStreaming: this.isCurrentlyStreaming()\\
+        });" "$SESSION_FILE"
 
 # Add diagnostic logging for stream end events
-sed -i '/endStream(datatype, sendStopCommand = false) {/a\
-        rootP2PLogger.info("Stream ending", {\
-            stationSN: this.rawStation.station_sn,\
-            dataType: P2PDataType[datatype],\
-            channel: this.currentMessageState[datatype].p2pStreamChannel,\
-            sendStopCommand: sendStopCommand,\
-            queuedDataSize: this.currentMessageState[datatype].queuedData.size\
-        });' "$SESSION_FILE"
+sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
+        ${LOGGER}.info(\"Stream ending\", {\\
+            stationSN: this.rawStation.station_sn,\\
+            dataType: P2PDataType[datatype],\\
+            channel: this.currentMessageState[datatype].p2pStreamChannel,\\
+            sendStopCommand: sendStopCommand,\\
+            queuedDataSize: this.currentMessageState[datatype].queuedData.size\\
+        });" "$SESSION_FILE"
 
 echo "✓ Patches applied successfully"
 echo "Verifying patches..."

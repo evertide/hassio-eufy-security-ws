@@ -110,43 +110,25 @@ sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION
 # PATCH eufy-security-ws: Add timeout fallback for receiveLivestream flag
 # This fixes the case where stream is requested but no data ever arrives
 # The original event chain fails because channel=-1 can't find the device
+# 
+# IMPORTANT: Must also send livestreamStopped event to HA so StreamStatus updates!
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
     echo "Patching eufy-security-ws message_handler.js..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
-    # Add timeout fallback after setting receiveLivestream = true
-    # Use a unique marker to find the right location (first occurrence in startLivestream case)
-    sed -i '/case DeviceCommand.startLivestream:/,/throw new LivestreamAlreadyRunningError/ {
-        /client\.receiveLivestream\[serialNumber\] = true;/{
-            N
-            s/client\.receiveLivestream\[serialNumber\] = true;\n/client.receiveLivestream[serialNumber] = true;\
-                        \/\/ [eufy-ws-patch] Fallback timeout: clear flag if stream never delivers data\
-                        const streamTimeoutId = setTimeout(() => {\
-                            if (client.receiveLivestream[serialNumber] === true) {\
-                                console.log("[eufy-ws-patch] Stream timeout for " + serialNumber + " - clearing receiveLivestream flag");\
-                                client.receiveLivestream[serialNumber] = false;\
-                            }\
-                        }, 35000);\
-/
-        }
-    }' "$WS_MESSAGE_HANDLER"
+    # Simpler and more reliable approach: replace the line with timeout that also sends event
+    # The timeout needs to:
+    # 1. Clear the receiveLivestream flag
+    # 2. Send the livestreamStopped event to the client so HA updates StreamStatus
+    sed -i 's/client\.receiveLivestream\[serialNumber\] = true;/client.receiveLivestream[serialNumber] = true; const _sn = serialNumber; const _cl = client; setTimeout(() => { if (_cl.receiveLivestream[_sn] === true) { console.log("[eufy-ws-patch] Stream timeout for " + _sn + " - sending livestreamStopped event"); if (_cl.schemaVersion >= 2 \&\& _cl.isConnected) { _cl.sendEvent({ source: "device", event: "livestream stopped", serialNumber: _sn }); } _cl.receiveLivestream[_sn] = false; } }, 35000);/' "$WS_MESSAGE_HANDLER"
     
     if grep -q "eufy-ws-patch" "$WS_MESSAGE_HANDLER"; then
-        echo "✓ eufy-security-ws stream timeout fallback applied"
+        echo "✓ eufy-security-ws stream timeout fallback applied (with event)"
         rm "$WS_MESSAGE_HANDLER.bak"
     else
-        echo "⚠ eufy-security-ws patch may not have applied (trying simpler approach)"
+        echo "✗ eufy-security-ws patch failed"
         mv "$WS_MESSAGE_HANDLER.bak" "$WS_MESSAGE_HANDLER"
-        
-        # Simpler approach: just append after the line
-        sed -i 's/client\.receiveLivestream\[serialNumber\] = true;/client.receiveLivestream[serialNumber] = true; setTimeout(() => { if (client.receiveLivestream[serialNumber] === true) { console.log("[eufy-ws-patch] Stream timeout - clearing flag for " + serialNumber); client.receiveLivestream[serialNumber] = false; } }, 35000);/' "$WS_MESSAGE_HANDLER"
-        
-        if grep -q "eufy-ws-patch" "$WS_MESSAGE_HANDLER"; then
-            echo "✓ eufy-security-ws stream timeout fallback applied (simple)"
-        else
-            echo "✗ eufy-security-ws patch failed"
-        fi
     fi
 else
     echo "⚠ eufy-security-ws message_handler.js not found at $WS_MESSAGE_HANDLER"

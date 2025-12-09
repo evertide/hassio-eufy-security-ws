@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fixes (v1.9.27)..."
+echo "Applying P2P session.js fixes (v1.9.28)..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
@@ -107,110 +107,112 @@ sed -i "/if (this.isLiveStreaming(device)) {/i\\
 sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION_FILE"
 
 # =====================================================
-# PATCH eufy-security-ws: Fix stale receiveLivestream flag issue
+# PATCH eufy-security-ws: Fix race condition with p2pStreamEnding
 # 
-# v1.9.27: COMPLETE REWRITE of the else branch in startLivestream handler
+# v1.9.28: The REAL fix
 # 
-# This approach replaces the ENTIRE else block to avoid sed pattern matching issues
-# when upgrading from v1.9.25 (which had different code in that spot)
+# Problem: isLiveStreaming() returns TRUE during p2pStreamEnding phase
+# even though the stream is actually ending. This causes:
+# - Branch 1 check (!isLiveStreaming) → FALSE (stream "is running")
+# - Branch 2 check (flag !== true) → FALSE (flag is true)
+# - Branch 3 → throws LivestreamAlreadyRunningError
+# 
+# Solution: In Branch 3, don't throw error. Instead:
+# - Log a warning that we detected a stale/ending stream
+# - Clear the old stream state and start a new one
+# - This handles both stale flags AND the p2pStreamEnding race
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
-    echo "Patching eufy-security-ws message_handler.js (v1.9.27 - complete rewrite)..."
+    echo "Patching eufy-security-ws message_handler.js (v1.9.28 - handle p2pStreamEnding race)..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
-    # Use node to do the replacement - more reliable than sed for complex JS
+    # Use node to do the replacement
     node -e "
 const fs = require('fs');
 const file = '$WS_MESSAGE_HANDLER';
 let content = fs.readFileSync(file, 'utf8');
 
-// Pattern to find the else block that throws LivestreamAlreadyRunningError
-// This matches both the original code AND any previous patch attempts
-const pattern = /else\s*\{\s*(?:throw new LivestreamAlreadyRunningError|if\s*\(\s*!station\.isLiveStreaming|client\.receiveLivestream\[serialNumber\]\s*=\s*true;\s*const\s*_sn)[^}]*\}/g;
+// Strategy: Find 'else if (client.receiveLivestream[serialNumber] !== true)' and then the else after it
+const marker = 'else if (client.receiveLivestream[serialNumber] !== true)';
+const markerIndex = content.indexOf(marker);
 
-// Check if we can find the startLivestream case
-if (content.includes('case DeviceCommand.startLivestream:')) {
-    // Find and replace the problematic else block
-    // We need to be more surgical - find the specific else that's the third branch
-    
-    // Strategy: Find 'else if (client.receiveLivestream[serialNumber] !== true)' and then the else after it
-    const marker = 'else if (client.receiveLivestream[serialNumber] !== true)';
-    const markerIndex = content.indexOf(marker);
-    
-    if (markerIndex !== -1) {
-        // Find the closing brace of this else-if block, then the else after it
-        let braceCount = 0;
-        let inBlock = false;
-        let elseStart = -1;
-        let elseEnd = -1;
-        
-        for (let i = markerIndex; i < content.length; i++) {
-            if (content[i] === '{') {
-                braceCount++;
-                inBlock = true;
-            } else if (content[i] === '}') {
-                braceCount--;
-                if (inBlock && braceCount === 0) {
-                    // Found end of else-if block, look for else
-                    const afterBlock = content.substring(i + 1, i + 100);
-                    const elseMatch = afterBlock.match(/^\s*else\s*\{/);
-                    if (elseMatch) {
-                        elseStart = i + 1 + afterBlock.indexOf('else');
-                        // Now find the end of the else block
-                        let elseBraceCount = 0;
-                        let inElse = false;
-                        for (let j = elseStart; j < content.length; j++) {
-                            if (content[j] === '{') {
-                                elseBraceCount++;
-                                inElse = true;
-                            } else if (content[j] === '}') {
-                                elseBraceCount--;
-                                if (inElse && elseBraceCount === 0) {
-                                    elseEnd = j + 1;
-                                    break;
-                                }
-                            }
+if (markerIndex === -1) {
+    console.log('Could not find marker in file');
+    process.exit(1);
+}
+
+// Find the closing brace of this else-if block, then the else after it
+let braceCount = 0;
+let inBlock = false;
+let elseStart = -1;
+let elseEnd = -1;
+
+for (let i = markerIndex; i < content.length; i++) {
+    if (content[i] === '{') {
+        braceCount++;
+        inBlock = true;
+    } else if (content[i] === '}') {
+        braceCount--;
+        if (inBlock && braceCount === 0) {
+            // Found end of else-if block, look for else
+            const afterBlock = content.substring(i + 1, i + 100);
+            const elseMatch = afterBlock.match(/^\s*else\s*\{/);
+            if (elseMatch) {
+                elseStart = i + 1 + afterBlock.indexOf('else');
+                // Now find the end of the else block
+                let elseBraceCount = 0;
+                let inElse = false;
+                for (let j = elseStart; j < content.length; j++) {
+                    if (content[j] === '{') {
+                        elseBraceCount++;
+                        inElse = true;
+                    } else if (content[j] === '}') {
+                        elseBraceCount--;
+                        if (inElse && elseBraceCount === 0) {
+                            elseEnd = j + 1;
+                            break;
                         }
                     }
-                    break;
                 }
             }
+            break;
         }
-        
-        if (elseStart !== -1 && elseEnd !== -1) {
-            const newElseBlock = \`else {
-                    // v1.9.27: Stale flag detection - check actual stream state before throwing error
-                    if (!station.isLiveStreaming(device)) {
-                        console.log(\"[eufy-ws-fix] Stale receiveLivestream flag detected for \" + serialNumber + \", clearing and starting new stream\");
+    }
+}
+
+if (elseStart === -1 || elseEnd === -1) {
+    console.log('Could not find else block boundaries');
+    process.exit(1);
+}
+
+// v1.9.28: Instead of checking isLiveStreaming (which includes p2pStreamEnding),
+// just log and start the stream. The underlying P2P layer will handle it.
+// If there's truly an active stream, startLivestream will fail naturally.
+// If the stream is ending, it will succeed after the ending completes.
+const newElseBlock = \`else {
+                    // v1.9.28: Handle race condition with p2pStreamEnding
+                    // We get here when: isLiveStreaming=true AND receiveLivestream[sn]=true
+                    // This can happen during the p2pStreamEnding phase when stream is actually ending
+                    // Instead of throwing error, try to start the stream - the P2P layer handles conflicts
+                    console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \", attempting to start new stream\");
+                    try {
                         station.startLivestream(device);
-                        if (!DeviceMessageHandler.streamingDevices[station.getSerial()] || !DeviceMessageHandler.streamingDevices[station.getSerial()].includes(client)) {
-                            DeviceMessageHandler.addStreamingDevice(station.getSerial(), client);
-                        }
-                    } else {
+                        // If we get here, stream started successfully (old one must have ended)
+                        console.log(\"[eufy-ws-fix] Successfully started new stream for \" + serialNumber);
+                    } catch (e) {
+                        // If startLivestream throws, there really is an active stream
+                        console.log(\"[eufy-ws-fix] Stream truly active for \" + serialNumber + \": \" + e.message);
                         throw new LivestreamAlreadyRunningError(\\\`Livestream for device \\\${serialNumber} is already running\\\`);
                     }
                 }\`;
-            
-            content = content.substring(0, elseStart) + newElseBlock + content.substring(elseEnd);
-            fs.writeFileSync(file, content);
-            console.log('Patch applied successfully');
-            process.exit(0);
-        } else {
-            console.log('Could not find else block boundaries');
-            process.exit(1);
-        }
-    } else {
-        console.log('Could not find marker in file');
-        process.exit(1);
-    }
-} else {
-    console.log('Could not find startLivestream case');
-    process.exit(1);
-}
+
+content = content.substring(0, elseStart) + newElseBlock + content.substring(elseEnd);
+fs.writeFileSync(file, content);
+console.log('Patch applied successfully');
 "
     
     if grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
-        echo "✓ eufy-security-ws stale flag fix applied"
+        echo "✓ eufy-security-ws race condition fix applied"
         rm "$WS_MESSAGE_HANDLER.bak"
     else
         echo "✗ eufy-security-ws patch failed"
@@ -269,10 +271,10 @@ fi
 
 # Check eufy-security-ws patch
 if [ -f "$WS_MESSAGE_HANDLER" ] && grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
-    echo "✓ CRITICAL: eufy-security-ws stale flag fix applied"
+    echo "✓ CRITICAL: eufy-security-ws race condition fix applied"
     VERIFIED=$((VERIFIED + 1))
 else
-    echo "⚠ eufy-security-ws stale flag fix not applied"
+    echo "⚠ eufy-security-ws race condition fix not applied"
 fi
 
 echo "Verified $VERIFIED/7 patches"

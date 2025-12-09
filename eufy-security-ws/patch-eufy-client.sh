@@ -24,9 +24,16 @@ fi
 
 echo "Using logger: $LOGGER"
 
-# Add RSSI tracking map at class level (after socket creation, matches both quote types)
-sed -i "/this\.socket = createSocket('udp4');/a\\
-        this.channelRSSI = new Map(); \/\/ Track RSSI per channel for diagnostics" "$SESSION_FILE"
+# Add RSSI tracking map in constructor - find the P2PClientProtocol constructor
+# Look for "constructor(" and add RSSI tracking after first this. assignment
+sed -i "/constructor(rawStation, api/,/^[[:space:]]*this\./ {
+    /^[[:space:]]*this\./a\\
+        this.channelRSSI = new Map(); \/\/ Track RSSI per channel for diagnostics
+    t end
+    b
+    :end
+    n
+}" "$SESSION_FILE"
 
 # Update WiFi RSSI handler to store the value
 sed -i '/this\.emit("wifi rssi", message\.channel, rssi);/i\
@@ -102,6 +109,11 @@ if [ "$VERIFIED" -eq 4 ]; then
     echo "Done!"
 else
     echo "✗ Patch verification failed (verified $VERIFIED/4)"
+    echo "Checking what went wrong..."
+    if ! grep -q "this.channelRSSI = new Map()" "$SESSION_FILE"; then
+        echo "DEBUG: RSSI Map not found, checking constructor pattern..."
+        grep -n "constructor(rawStation" "$SESSION_FILE" | head -3
+    fi
     mv "$SESSION_FILE.bak" "$SESSION_FILE"
     exit 1
 fi

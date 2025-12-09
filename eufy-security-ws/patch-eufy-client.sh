@@ -12,7 +12,7 @@ fi
 # Create backup
 cp "$SESSION_FILE" "$SESSION_FILE.bak"
 
-# Find the correct logger reference in the compiled file
+# Find the correct logger reference
 LOGGER_REF=$(grep -o 'logging_1' "$SESSION_FILE" | head -1)
 if [ -n "$LOGGER_REF" ]; then
     LOGGER="logging_1.rootP2PLogger"
@@ -23,18 +23,29 @@ else
 fi
 
 echo "Using logger: $LOGGER"
-echo "Using datatype: $DATATYPE"
 
-# Apply the malformed packet fix
+# Add RSSI tracking map at class level (after constructor)
+sed -i '/this\.socket = createSocket("udp4");/a\
+        this.channelRSSI = new Map(); \/\/ Track RSSI per channel for diagnostics' "$SESSION_FILE"
+
+# Update WiFi RSSI handler to store the value
+sed -i '/this\.emit("wifi rssi", message\.channel, rssi);/i\
+                    this.channelRSSI.set(message.channel, { rssi: rssi, timestamp: Date.now() });' "$SESSION_FILE"
+
+# Apply the malformed packet fix with RSSI context
 sed -i "/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAGIC_WORD;/a\\
                 \/\/ Check for malformed initial packets (before processing starts)\\
                 if (!firstPartMessage \&\& this.currentMessageBuilder[message.type].header.bytesToRead === 0) {\\
+                    const rssiData = this.channelRSSI.get(0) || {};\\
                     ${LOGGER}.info(\"Discarding malformed P2P packet\", {\\
                         stationSN: this.rawStation.station_sn,\\
                         seqNo: message.seqNo,\\
                         dataType: ${DATATYPE}[message.type],\\
                         first4Bytes: data.subarray(0, 4).toString(\"hex\"),\\
-                        dataLength: data.length\\
+                        dataLength: data.length,\\
+                        rssi: rssiData.rssi,\\
+                        rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null,\\
+                        queueSize: this.currentMessageState[message.type].queuedData.size\\
                     });\\
                     data = Buffer.from([]);\\
                     this.currentMessageState[message.type].leftoverData = Buffer.from([]);\\
@@ -48,14 +59,17 @@ sed -i "/onClose() {/a\\
             wasStreaming: this.isCurrentlyStreaming()\\
         });" "$SESSION_FILE"
 
-# Add diagnostic logging for stream end events (simpler version without P2PDataType lookup)
+# Add diagnostic logging for stream end events with RSSI
 sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
+        const rssiData = this.channelRSSI.get(this.currentMessageState[datatype].p2pStreamChannel) || {};\\
         ${LOGGER}.info(\"Stream ending\", {\\
             stationSN: this.rawStation.station_sn,\\
             datatype: datatype,\\
             channel: this.currentMessageState[datatype].p2pStreamChannel,\\
             sendStopCommand: sendStopCommand,\\
-            queuedDataSize: this.currentMessageState[datatype].queuedData.size\\
+            queuedDataSize: this.currentMessageState[datatype].queuedData.size,\\
+            rssi: rssiData.rssi,\\
+            rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null\\
         });" "$SESSION_FILE"
 
 echo "✓ Patches applied successfully"
@@ -77,12 +91,17 @@ if grep -q "Stream ending" "$SESSION_FILE"; then
     VERIFIED=$((VERIFIED + 1))
 fi
 
-if [ "$VERIFIED" -eq 3 ]; then
+if grep -q "this.channelRSSI = new Map()" "$SESSION_FILE"; then
+    echo "✓ RSSI tracking verified"
+    VERIFIED=$((VERIFIED + 1))
+fi
+
+if [ "$VERIFIED" -eq 4 ]; then
     echo "✓ All patches verified"
     rm "$SESSION_FILE.bak"
     echo "Done!"
 else
-    echo "✗ Patch verification failed (verified $VERIFIED/3)"
+    echo "✗ Patch verification failed (verified $VERIFIED/4)"
     mv "$SESSION_FILE.bak" "$SESSION_FILE"
     exit 1
 fi

@@ -20,51 +20,29 @@ fi
 cp "$SESSION_FILE" "$SESSION_FILE.bak"
 cp "$STATION_FILE" "$STATION_FILE.bak"
 
-echo "Applying patches using Node.js..."
+echo "Applying patches using sed..."
 
-# Use Node.js to apply complex patches
-node << 'NODESCRIPT'
-const fs = require('fs');
+# --- PREPARE PATCH FILES ---
 
-const SESSION_FILE = 'node_modules/eufy-security-client/build/p2p/session.js';
-const STATION_FILE = 'node_modules/eufy-security-client/build/http/station.js';
-
-let sessionContent = fs.readFileSync(SESSION_FILE, 'utf8');
-let stationContent = fs.readFileSync(STATION_FILE, 'utf8');
-
-// PATCH 1: Malformed packet detection with RSSI logging
-const malformedPacketCode = `                const firstBytes = this.rawData.slice(0, 4);
+# Patch 1 Content
+cat > patch1.js << 'EOF'
+                const firstBytes = this.rawData.slice(0, 4);
                 const maybeHeader = firstBytes.readUInt32BE(0);
                 if (maybeHeader !== 0x585a5948) {
                     const rssiInfo = this.channelRSSI.get(channel) || { rssi: undefined, timestamp: 0 };
                     const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
-                    rootP2PLogger.warn(\`Discarding malformed P2P packet (station: \${this.rawStation.station_sn}, channel: \${channel}, size: \${this.rawData.length}, first4bytes: 0x\${maybeHeader.toString(16)}, RSSI: \${rssiInfo.rssi}, RSSI age: \${rssiAge}ms)\`);
+                    rootP2PLogger.warn(`Discarding malformed P2P packet (station: ${this.rawStation.station_sn}, channel: ${channel}, size: ${this.rawData.length}, first4bytes: 0x${maybeHeader.toString(16)}, RSSI: ${rssiInfo.rssi}, RSSI age: ${rssiAge}ms)`);
                     this.rawData = Buffer.from([]);
                     return;
-                }`;
+                }
+EOF
 
-sessionContent = sessionContent.replace(
-    'if (this.rawData.length >= 4 && bytesToRead === 0) {',
-    'if (this.rawData.length >= 4 && bytesToRead === 0) {\n' + malformedPacketCode
-);
-
-// PATCH 2: Add RSSI tracking map
-sessionContent = sessionContent.replace(
-    'this.currentMessageState = {};',
-    'this.currentMessageState = {}; this.channelRSSI = new Map();'
-);
-
-// PATCH 3: Connection close diagnostics
-sessionContent = sessionContent.replace(
-    'rootP2PLogger.debug(`P2P connection closed`, { stationSN: this.rawStation.station_sn });',
-    'const wasStreaming = Object.values(this.currentMessageState).some(s => s?.p2pStreaming); rootP2PLogger.info(`P2P connection closed`, { stationSN: this.rawStation.station_sn, wasStreaming });'
-);
-
-// PATCH 4: Stream end diagnostics
-const streamEndCode = `        const queuedDataSize = this.messageStatesQueue.get(datatype)?.data.length || 0;
+# Patch 4 Content
+cat > patch4.js << 'EOF'
+        const queuedDataSize = this.messageStatesQueue.get(datatype)?.data.length || 0;
         const rssiInfo = this.channelRSSI.get(this.currentMessageState[datatype].p2pStreamChannel) || { rssi: undefined, timestamp: 0 };
         const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
-        rootP2PLogger.info(\`Stream ending\`, {
+        rootP2PLogger.info(`Stream ending`, {
             stationSN: this.rawStation.station_sn,
             datatype,
             channel: this.currentMessageState[datatype].p2pStreamChannel,
@@ -72,15 +50,12 @@ const streamEndCode = `        const queuedDataSize = this.messageStatesQueue.ge
             queuedDataSize,
             rssi: rssiInfo.rssi,
             rssiAge
-        });`;
+        });
+EOF
 
-sessionContent = sessionContent.replace(
-    /rootP2PLogger\.debug\(`\$\{P2PClientProtocol\.TAG\} endStream: Stopping livestream\.\.\.`\);/,
-    '$&\n' + streamEndCode
-);
-
-// PATCH 5: Race condition fix in station.js
-const raceConditionCode = `        const streamingState = this.isLiveStreaming(device);
+# Patch 5 Content
+cat > patch5.js << 'EOF'
+        const streamingState = this.isLiveStreaming(device);
         if (streamingState) {
             rootHTTPLogger.child({ prefix: "http" }).info("Race condition detected: Stream state check", {
                 device: device.getSerial(),
@@ -88,32 +63,41 @@ const raceConditionCode = `        const streamingState = this.isLiveStreaming(d
                 isStreaming: streamingState,
                 action: "startLivestream blocked"
             });
-        }`;
+        }
+EOF
 
-stationContent = stationContent.replace(
-    'const device = this.getDeviceByChannel(channel);',
-    'const device = this.getDeviceByChannel(channel);\n' + raceConditionCode
-);
+# --- APPLY PATCHES ---
 
-stationContent = stationContent.replace(
-    'if (this.isLiveStreaming(device)) {',
-    'if (streamingState) {'
-);
+# PATCH 1: Malformed packet detection
+# Insert after: if (this.rawData.length >= 4 && bytesToRead === 0) {
+sed -i '/if (this.rawData.length >= 4 && bytesToRead === 0) {/r patch1.js' "$SESSION_FILE"
 
-// PATCH 6: Remove p2pStreamNotStarted check from livestream stopped event
-sessionContent = sessionContent.replace(
-    /!this\.currentMessageState\[datatype\]\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/g,
-    '!this.currentMessageState[datatype].invalidStream'
-);
+# PATCH 2: RSSI tracking map
+sed -i 's/this.currentMessageState = {};/this.currentMessageState = {}; this.channelRSSI = new Map();/' "$SESSION_FILE"
 
-// Write patched files
-fs.writeFileSync(SESSION_FILE, sessionContent, 'utf8');
-fs.writeFileSync(STATION_FILE, stationContent, 'utf8');
+# PATCH 3: Connection close diagnostics
+sed -i 's/rootP2PLogger.debug(`P2P connection closed`, { stationSN: this.rawStation.station_sn });/const wasStreaming = Object.values(this.currentMessageState).some(s => s?.p2pStreaming); rootP2PLogger.info(`P2P connection closed`, { stationSN: this.rawStation.station_sn, wasStreaming });/' "$SESSION_FILE"
 
-console.log('✓ Patches applied using Node.js');
-NODESCRIPT
+# PATCH 4: Stream end diagnostics
+# Insert after: rootP2PLogger.debug(`${P2PClientProtocol.TAG} endStream: Stopping livestream...`);
+sed -i "/rootP2PLogger.debug(\`\${P2PClientProtocol.TAG} endStream: Stopping livestream...\`);/r patch4.js" "$SESSION_FILE"
 
-echo "Verifying patches..."
+# PATCH 5: Race condition fix
+# Insert after: const device = this.getDeviceByChannel(channel);
+sed -i '/const device = this.getDeviceByChannel(channel);/r patch5.js' "$STATION_FILE"
+
+# Replace check
+sed -i 's/if (this.isLiveStreaming(device)) {/if (streamingState) {/' "$STATION_FILE"
+
+# PATCH 6: Livestream stopped fix (CRITICAL)
+# Remove p2pStreamNotStarted check
+sed -i 's/!this.currentMessageState\[datatype\].invalidStream && !this.currentMessageState\[datatype\].p2pStreamNotStarted/!this.currentMessageState[datatype].invalidStream/' "$SESSION_FILE"
+
+# Cleanup temp files
+rm patch1.js patch4.js patch5.js
+
+echo "✓ Patches applied"
+echo "Verifying..."
 
 VERIFIED=0
 

@@ -160,3 +160,28 @@ Each should return `1`.
 
 ****Version**: 1.9.11
 **Last Updated**: December 9, 2025
+
+### 5. Race Condition Detection (Debug)
+**Purpose**: Log when the stream state race condition is detected to verify if it occurs and help validate the fix.
+
+**Information Logged**:
+- Device serial number
+- Station serial number
+- Stream state when checked
+- Action taken (startLivestream blocked)
+
+**What to Look For**:
+```
+Race condition detected: Stream state check {
+  device: 'T84A1P1025021F7C',
+  station: 'T84A1P1025020FEF',
+  isStreaming: true,
+  action: 'startLivestream blocked'
+}
+```
+
+If you see this message followed immediately by `LivestreamAlreadyRunningError`, it confirms the race condition is occurring and would benefit from the `p2pStreamEnding` flag fix in the fork.
+
+**Code Location**: `src/http/station.ts` - `startLivestream()` method
+
+**Temporary**: This logging will be removed once race condition frequency is determined.

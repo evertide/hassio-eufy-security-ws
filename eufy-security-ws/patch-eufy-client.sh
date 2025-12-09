@@ -4,28 +4,37 @@ set -e
 echo "Applying P2P session.js fix for malformed packets with diagnostics..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
+STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
+
 if [ ! -f "$SESSION_FILE" ]; then
     echo "ERROR: session.js not found at $SESSION_FILE"
     exit 1
 fi
 
-# Create backup
+if [ ! -f "$STATION_FILE" ]; then
+    echo "ERROR: station.js not found at $STATION_FILE"
+    exit 1
+fi
+
+# Create backups
 cp "$SESSION_FILE" "$SESSION_FILE.bak"
+cp "$STATION_FILE" "$STATION_FILE.bak"
 
 # Find the correct logger reference
 LOGGER_REF=$(grep -o 'logging_1' "$SESSION_FILE" | head -1)
 if [ -n "$LOGGER_REF" ]; then
     LOGGER="logging_1.rootP2PLogger"
+    HTTP_LOGGER="logging_1.rootHTTPLogger"
     DATATYPE="types_1.P2PDataType"
 else
     LOGGER="rootP2PLogger"
+    HTTP_LOGGER="rootHTTPLogger"
     DATATYPE="P2PDataType"
 fi
 
 echo "Using logger: $LOGGER"
 
-# Add RSSI tracking map in constructor - find the P2PClientProtocol constructor
-# Look for "constructor(" and add RSSI tracking after first this. assignment
+# Add RSSI tracking map in constructor
 sed -i "/constructor(rawStation, api/,/^[[:space:]]*this\./ {
     /^[[:space:]]*this\./a\\
         this.channelRSSI = new Map(); \/\/ Track RSSI per channel for diagnostics
@@ -79,6 +88,22 @@ sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
             rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null\\
         });" "$SESSION_FILE"
 
+# Add race condition detection in startLivestream (station.js)
+# Log when we check isLiveStreaming just before potential error
+sed -i "/if (this.isLiveStreaming(device)) {/i\\
+        const streamingState = this.isLiveStreaming(device);\\
+        if (streamingState) {\\
+            ${HTTP_LOGGER}.info(\"Race condition detected: Stream state check\", {\\
+                device: device.getSerial(),\\
+                station: this.getSerial(),\\
+                isStreaming: streamingState,\\
+                action: \"startLivestream blocked\"\\
+            });\\
+        }" "$STATION_FILE"
+
+# Replace the original if statement to use our stored variable
+sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION_FILE"
+
 echo "✓ Patches applied successfully"
 echo "Verifying patches..."
 
@@ -103,17 +128,28 @@ if grep -q "this.channelRSSI = new Map()" "$SESSION_FILE"; then
     VERIFIED=$((VERIFIED + 1))
 fi
 
-if [ "$VERIFIED" -eq 4 ]; then
+if grep -q "Race condition detected" "$STATION_FILE"; then
+    echo "✓ Race condition detection verified"
+    VERIFIED=$((VERIFIED + 1))
+fi
+
+if [ "$VERIFIED" -eq 5 ]; then
     echo "✓ All patches verified"
     rm "$SESSION_FILE.bak"
+    rm "$STATION_FILE.bak"
     echo "Done!"
 else
-    echo "✗ Patch verification failed (verified $VERIFIED/4)"
+    echo "✗ Patch verification failed (verified $VERIFIED/5)"
     echo "Checking what went wrong..."
     if ! grep -q "this.channelRSSI = new Map()" "$SESSION_FILE"; then
         echo "DEBUG: RSSI Map not found, checking constructor pattern..."
         grep -n "constructor(rawStation" "$SESSION_FILE" | head -3
     fi
+    if ! grep -q "Race condition detected" "$STATION_FILE"; then
+        echo "DEBUG: Race condition logging not found, checking pattern..."
+        grep -n "if (this.isLiveStreaming(device))" "$STATION_FILE" | head -3
+    fi
     mv "$SESSION_FILE.bak" "$SESSION_FILE"
+    mv "$STATION_FILE.bak" "$STATION_FILE"
     exit 1
 fi

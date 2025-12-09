@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fixes..."
+echo "Applying P2P session.js fixes (v1.9.26)..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
@@ -50,23 +50,23 @@ sed -i '/this\.emit("wifi rssi", message\.channel, rssi);/i\
 
 # Apply the malformed packet fix with RSSI context
 sed -i "/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAGIC_WORD;/a\\
-                \/\/ Check for malformed initial packets (before processing starts)\\
-                if (!firstPartMessage \&\& this.currentMessageBuilder[message.type].header.bytesToRead === 0) {\\
-                    const rssiData = this.channelRSSI.get(0) || {};\\
-                    ${LOGGER}.info(\"Discarding malformed P2P packet\", {\\
-                        stationSN: this.rawStation.station_sn,\\
-                        seqNo: message.seqNo,\\
-                        dataType: ${DATATYPE}[message.type],\\
-                        first4Bytes: data.subarray(0, 4).toString(\"hex\"),\\
-                        dataLength: data.length,\\
-                        rssi: rssiData.rssi,\\
-                        rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null,\\
-                        queueSize: this.currentMessageState[message.type].queuedData.size\\
-                    });\\
-                    data = Buffer.from([]);\\
-                    this.currentMessageState[message.type].leftoverData = Buffer.from([]);\\
-                    break;\\
-                }" "$SESSION_FILE"
+                    \/\/ Check for malformed initial packets (before processing starts)\\
+                    if (!firstPartMessage \&\& this.currentMessageBuilder[message.type].header.bytesToRead === 0) {\\
+                        const rssiData = this.channelRSSI.get(0) || {};\\
+                        ${LOGGER}.info(\"Discarding malformed P2P packet\", {\\
+                            stationSN: this.rawStation.station_sn,\\
+                            seqNo: message.seqNo,\\
+                            dataType: ${DATATYPE}[message.type],\\
+                            first4Bytes: data.subarray(0, 4).toString(\"hex\"),\\
+                            dataLength: data.length,\\
+                            rssi: rssiData.rssi,\\
+                            rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null,\\
+                            queueSize: this.currentMessageState[message.type].queuedData.size\\
+                        });\\
+                        data = Buffer.from([]);\\
+                        this.currentMessageState[message.type].leftoverData = Buffer.from([]);\\
+                        break;\\
+                    }" "$SESSION_FILE"
 
 # Add diagnostic logging for connection close events
 sed -i "/onClose() {/a\\
@@ -88,7 +88,7 @@ sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
             rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null\\
         });" "$SESSION_FILE"
 
-# FIX ISSUE 2: Always emit livestream stopped event
+# FIX ISSUE 2a: Always emit livestream stopped event (in eufy-security-client)
 echo "Applying livestream stopped event fix..."
 sed -i 's/\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/.invalidStream/' "$SESSION_FILE"
 
@@ -107,28 +107,46 @@ sed -i "/if (this.isLiveStreaming(device)) {/i\\
 sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION_FILE"
 
 # =====================================================
-# PATCH eufy-security-ws: Add timeout fallback for receiveLivestream flag
-# This fixes the case where stream is requested but no data ever arrives
-# The original event chain fails because channel=-1 can't find the device
+# PATCH eufy-security-ws: Fix stale receiveLivestream flag issue
 # 
-# IMPORTANT: Must also send livestreamStopped event to HA so StreamStatus updates!
+# v1.9.26: NEW APPROACH - Instead of timeout, handle stale flag at decision time
+# 
+# Problem: receiveLivestream[sn]=true can become stale when:
+# - Stream ends but event propagation is slow (race condition)
+# - getStationDevice() fails with channel=-1 (no data received)
+# 
+# Solution: In the else branch where we would throw LivestreamAlreadyRunningError,
+# double-check if the stream is ACTUALLY running. If not, it's a stale flag - 
+# clear it and start a new stream instead of throwing an error.
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
-    echo "Patching eufy-security-ws message_handler.js..."
+    echo "Patching eufy-security-ws message_handler.js (v1.9.26 - stale flag fix)..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
-    # Simpler and more reliable approach: replace the line with timeout that also sends event
-    # The timeout needs to:
-    # 1. Clear the receiveLivestream flag
-    # 2. Send the livestreamStopped event to the client so HA updates StreamStatus
-    sed -i 's/client\.receiveLivestream\[serialNumber\] = true;/client.receiveLivestream[serialNumber] = true; const _sn = serialNumber; const _cl = client; setTimeout(() => { if (_cl.receiveLivestream[_sn] === true) { console.log("[eufy-ws-patch] Stream timeout for " + _sn + " - sending livestreamStopped event"); if (_cl.schemaVersion >= 2 \&\& _cl.isConnected) { _cl.sendEvent({ source: "device", event: "livestream stopped", serialNumber: _sn }); } _cl.receiveLivestream[_sn] = false; } }, 35000);/' "$WS_MESSAGE_HANDLER"
-    
-    if grep -q "eufy-ws-patch" "$WS_MESSAGE_HANDLER"; then
-        echo "✓ eufy-security-ws stream timeout fallback applied (with event)"
+    # Replace the simple error throw with a smarter check
+    # Original: throw new LivestreamAlreadyRunningError(`Livestream for device ${serialNumber} is already running`);
+    # New: Check if stream is actually running, if not, handle stale flag
+    sed -i 's/throw new LivestreamAlreadyRunningError(`Livestream for device \${serialNumber} is already running`);/if (!station.isLiveStreaming(device)) { console.log("[eufy-ws-fix] Stale receiveLivestream flag detected for " + serialNumber + ", clearing and starting new stream"); station.startLivestream(device); if (!DeviceMessageHandler.streamingDevices[station.getSerial()]?.includes(client)) { DeviceMessageHandler.addStreamingDevice(station.getSerial(), client); } } else { throw new LivestreamAlreadyRunningError(`Livestream for device ${serialNumber} is already running`); }/' "$WS_MESSAGE_HANDLER"
+
+    if grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
+        echo "✓ eufy-security-ws stale flag fix applied"
         rm "$WS_MESSAGE_HANDLER.bak"
     else
-        echo "✗ eufy-security-ws patch failed"
+        echo "✗ eufy-security-ws patch failed, trying alternative pattern..."
+        # Restore backup
         mv "$WS_MESSAGE_HANDLER.bak" "$WS_MESSAGE_HANDLER"
+        cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
+        
+        # Try with escaped backticks for different shell interpretations
+        sed -i "s/throw new LivestreamAlreadyRunningError(\`Livestream for device \\\${serialNumber} is already running\`);/if (!station.isLiveStreaming(device)) { console.log(\"[eufy-ws-fix] Stale receiveLivestream flag detected for \" + serialNumber + \", clearing and starting new stream\"); station.startLivestream(device); if (!DeviceMessageHandler.streamingDevices[station.getSerial()]?.includes(client)) { DeviceMessageHandler.addStreamingDevice(station.getSerial(), client); } } else { throw new LivestreamAlreadyRunningError(\`Livestream for device \${serialNumber} is already running\`); }/" "$WS_MESSAGE_HANDLER"
+        
+        if grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
+            echo "✓ eufy-security-ws stale flag fix applied (alternative pattern)"
+            rm "$WS_MESSAGE_HANDLER.bak"
+        else
+            echo "✗ eufy-security-ws patch failed completely"
+            mv "$WS_MESSAGE_HANDLER.bak" "$WS_MESSAGE_HANDLER"
+        fi
     fi
 else
     echo "⚠ eufy-security-ws message_handler.js not found at $WS_MESSAGE_HANDLER"
@@ -182,18 +200,18 @@ else
 fi
 
 # Check eufy-security-ws patch
-if [ -f "$WS_MESSAGE_HANDLER" ] && grep -q "eufy-ws-patch" "$WS_MESSAGE_HANDLER"; then
-    echo "✓ CRITICAL: eufy-security-ws timeout fallback applied"
+if [ -f "$WS_MESSAGE_HANDLER" ] && grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
+    echo "✓ CRITICAL: eufy-security-ws stale flag fix applied"
     VERIFIED=$((VERIFIED + 1))
 else
-    echo "⚠ eufy-security-ws timeout fallback not applied"
+    echo "⚠ eufy-security-ws stale flag fix not applied"
 fi
 
 echo "Verified $VERIFIED/7 patches"
 
 # Only fail if critical patch didn't apply
 if grep -q 'invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted' "$SESSION_FILE"; then
-    echo "ERROR: Critical patch (Issue 2) failed to apply!"
+    echo "ERROR: Critical patch (Issue 2a) failed to apply!"
     mv "$SESSION_FILE.bak" "$SESSION_FILE"
     mv "$STATION_FILE.bak" "$STATION_FILE"
     exit 1

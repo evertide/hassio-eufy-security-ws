@@ -13,21 +13,17 @@ fi
 cp "$SESSION_FILE" "$SESSION_FILE.bak"
 
 # Find the correct logger reference in the compiled file
-LOGGER_REF=$(grep -o 'logging_1\|rootP2PLogger' "$SESSION_FILE" | head -1)
-if [ -z "$LOGGER_REF" ]; then
-    echo "ERROR: Could not find logger reference"
-    mv "$SESSION_FILE.bak" "$SESSION_FILE"
-    exit 1
-fi
-
-# If it's the CommonJS module pattern, use logging_1.rootP2PLogger
-if [ "$LOGGER_REF" = "logging_1" ]; then
+LOGGER_REF=$(grep -o 'logging_1' "$SESSION_FILE" | head -1)
+if [ -n "$LOGGER_REF" ]; then
     LOGGER="logging_1.rootP2PLogger"
+    DATATYPE="types_1.P2PDataType"
 else
     LOGGER="rootP2PLogger"
+    DATATYPE="P2PDataType"
 fi
 
-echo "Using logger reference: $LOGGER"
+echo "Using logger: $LOGGER"
+echo "Using datatype: $DATATYPE"
 
 # Apply the malformed packet fix
 sed -i "/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAGIC_WORD;/a\\
@@ -36,7 +32,7 @@ sed -i "/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAG
                     ${LOGGER}.info(\"Discarding malformed P2P packet\", {\\
                         stationSN: this.rawStation.station_sn,\\
                         seqNo: message.seqNo,\\
-                        dataType: P2PDataType[message.type],\\
+                        dataType: ${DATATYPE}[message.type],\\
                         first4Bytes: data.subarray(0, 4).toString(\"hex\"),\\
                         dataLength: data.length\\
                     });\\
@@ -52,11 +48,11 @@ sed -i "/onClose() {/a\\
             wasStreaming: this.isCurrentlyStreaming()\\
         });" "$SESSION_FILE"
 
-# Add diagnostic logging for stream end events
+# Add diagnostic logging for stream end events (simpler version without P2PDataType lookup)
 sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
         ${LOGGER}.info(\"Stream ending\", {\\
             stationSN: this.rawStation.station_sn,\\
-            dataType: P2PDataType[datatype],\\
+            datatype: datatype,\\
             channel: this.currentMessageState[datatype].p2pStreamChannel,\\
             sendStopCommand: sendStopCommand,\\
             queuedDataSize: this.currentMessageState[datatype].queuedData.size\\

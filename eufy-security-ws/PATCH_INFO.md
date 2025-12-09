@@ -98,3 +98,65 @@ Each should return `1`.
 - Add-on version: 1.9.8
 - Base package: eufy-security-ws@1.9.3
 - Target library: eufy-security-client@3.5.0
+
+## Known Issues Not Patched
+
+### Stream State Race Condition
+**Issue**: After network disruption, `LivestreamAlreadyRunningError` can occur when stream timeout and client restart execute simultaneously.
+
+**Root Cause**: Race condition between:
+1. P2P layer calling `endStream()` due to 5-second data timeout
+2. Client (eufy-security-ws) attempting `startLivestream()` after reconnection
+3. `isLiveStreaming()` check returns false, but by the time `startLivestream()` executes, state is transitioning
+
+**Sequence**:
+```
+13:29:41.611 - endStream() called for F7C
+13:29:41.984 - ERROR: LivestreamAlreadyRunningError thrown
+```
+
+**Why Not Patched**:
+- Fix requires modifying TypeScript interface to add `p2pStreamEnding` flag
+- Runtime JavaScript patching can't modify compiled interface definitions
+- Proper fix requires upstream change in eufy-security-client
+
+**Workaround**: 
+- eufy-security-ws has retry logic that handles this error
+- After brief wait, retry succeeds as stream cleanup completes
+- Not critical since error is recoverable
+
+**Proper Fix Location**: 
+- Fork: https://github.com/evertide/eufy-security-client
+- Commit: 885bfd6 - "Fix race condition in stream state management"
+- Adds `p2pStreamEnding` boolean flag to block new streams during teardown
+
+**Upstream PR**: Prepared but held as draft per maintainer request
+
+## Investigation Results
+
+### T84A1 Wall Light Cam S100 Testing
+
+**Problem**: T84A1P1025021F7C experiencing "Infinite loop detected" errors and frequent stream dropouts.
+
+**Root Cause Confirmed**: **Weak WiFi signal** causing packet corruption at protocol level.
+
+**Evidence**:
+- Before WiFi improvement (12:50-13:01, 11 min): 420 malformed packets (38.2/min)
+- After WiFi improvement (13:25-13:30, 5 min): 0 malformed packets from F7C
+- **100% elimination** by moving camera to dedicated AP with strong signal
+
+**RSSI Findings**:
+- T84A1 cameras do NOT send `CMD_WIFI_CONFIG` messages
+- RSSI tracking shows `undefined` for these devices
+- Cannot use RSSI for real-time monitoring on T84A1
+- Other device types (doorbells, indoor cams) do send WiFi config
+
+**Recommendation**: 
+- Ensure strong WiFi coverage (-60 dBm or better) for T84A1 cameras
+- Monitor malformed packet rate as proxy for signal quality
+- Consider dedicated 2.4GHz AP on clear channel for outdoor cameras
+
+---
+
+**Version**: 1.9.10
+**Last Updated**: December 9, 2025

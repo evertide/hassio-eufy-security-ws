@@ -29,22 +29,31 @@ function applyPatch(filePath, patchName, regex, replacement) {
     } else {
         console.error(`❌ Error: Pattern not found for patch '${patchName}' in ${filePath}`);
         // Print a snippet of the file to help debugging
-        console.log(`File content snippet (first 200 chars): ${content.substring(0, 200)}`);
+        const match = content.match(/MAGIC_WORD/);
+        if (match) {
+            console.log(`Context around MAGIC_WORD:\n${content.substring(match.index - 100, match.index + 200)}`);
+        } else {
+            console.log(`File content snippet (first 200 chars): ${content.substring(0, 200)}`);
+        }
         process.exit(1);
     }
 }
 
 // PATCH 1: Malformed packet detection
-const patch1Regex = /if\s*\(\s*this\.rawData\.length\s*>=\s*4\s*&&\s*bytesToRead\s*===\s*0\s*\)\s*\{/;
-const patch1Code = `if (this.rawData.length >= 4 && bytesToRead === 0) {
-                const firstBytes = this.rawData.slice(0, 4);
-                const maybeHeader = firstBytes.readUInt32BE(0);
-                if (maybeHeader !== 0x585a5948) {
-                    const rssiInfo = this.channelRSSI.get(channel) || { rssi: undefined, timestamp: 0 };
-                    const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
-                    rootP2PLogger.warn(\`Discarding malformed P2P packet (station: \${this.rawStation.station_sn}, channel: \${channel}, size: \${this.rawData.length}, first4bytes: 0x\${maybeHeader.toString(16)}, RSSI: \${rssiInfo.rssi}, RSSI age: \${rssiAge}ms)\`);
-                    this.rawData = Buffer.from([]);
-                    return;
+// Target: const firstPartMessage = data.subarray(0, 4).toString() === MAGIC_WORD;
+const patch1Regex = /(const\s+firstPartMessage\s*=\s*data\.subarray\(0,\s*4\)\.toString\(\)\s*===\s*MAGIC_WORD;)/;
+const patch1Code = `$1
+                if (!firstPartMessage && this.currentMessageBuilder[message.type].header.bytesToRead === 0) {
+                    const firstBytes = data.slice(0, 4);
+                    const maybeHeader = firstBytes.readUInt32BE(0);
+                    if (maybeHeader !== 0x585a5948) {
+                        const rssiInfo = this.channelRSSI ? (this.channelRSSI.get(0) || { rssi: undefined, timestamp: 0 }) : { rssi: undefined, timestamp: 0 };
+                        const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
+                        rootP2PLogger.warn(\`Discarding malformed P2P packet (station: \${this.rawStation.station_sn}, size: \${data.length}, first4bytes: 0x\${maybeHeader.toString(16)}, RSSI: \${rssiInfo.rssi}, RSSI age: \${rssiAge}ms)\`);
+                        data = Buffer.from([]);
+                        this.currentMessageState[message.type].leftoverData = Buffer.from([]);
+                        // break; // Cannot break here easily in replace, but clearing data is enough
+                    }
                 }`;
 applyPatch(SESSION_FILE, 'Malformed Packet Detection', patch1Regex, patch1Code);
 
@@ -62,7 +71,7 @@ applyPatch(SESSION_FILE, 'Connection Diagnostics', patch3Regex, patch3Code);
 const patch4Regex = /rootP2PLogger\.debug\(\s*`\$\{P2PClientProtocol\.TAG\}\s*endStream:\s*Stopping\s*livestream\.\.\.`\s*\);/;
 const patch4Code = `rootP2PLogger.debug(\`\${P2PClientProtocol.TAG} endStream: Stopping livestream...\`);
         const queuedDataSize = this.messageStatesQueue.get(datatype)?.data.length || 0;
-        const rssiInfo = this.channelRSSI.get(this.currentMessageState[datatype].p2pStreamChannel) || { rssi: undefined, timestamp: 0 };
+        const rssiInfo = this.channelRSSI ? (this.channelRSSI.get(this.currentMessageState[datatype].p2pStreamChannel) || { rssi: undefined, timestamp: 0 }) : { rssi: undefined, timestamp: 0 };
         const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
         rootP2PLogger.info(\`Stream ending\`, {
             stationSN: this.rawStation.station_sn,

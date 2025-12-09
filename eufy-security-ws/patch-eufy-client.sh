@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fixes (v1.9.26)..."
+echo "Applying P2P session.js fixes (v1.9.27)..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
@@ -109,44 +109,112 @@ sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION
 # =====================================================
 # PATCH eufy-security-ws: Fix stale receiveLivestream flag issue
 # 
-# v1.9.26: NEW APPROACH - Instead of timeout, handle stale flag at decision time
+# v1.9.27: COMPLETE REWRITE of the else branch in startLivestream handler
 # 
-# Problem: receiveLivestream[sn]=true can become stale when:
-# - Stream ends but event propagation is slow (race condition)
-# - getStationDevice() fails with channel=-1 (no data received)
-# 
-# Solution: In the else branch where we would throw LivestreamAlreadyRunningError,
-# double-check if the stream is ACTUALLY running. If not, it's a stale flag - 
-# clear it and start a new stream instead of throwing an error.
+# This approach replaces the ENTIRE else block to avoid sed pattern matching issues
+# when upgrading from v1.9.25 (which had different code in that spot)
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
-    echo "Patching eufy-security-ws message_handler.js (v1.9.26 - stale flag fix)..."
+    echo "Patching eufy-security-ws message_handler.js (v1.9.27 - complete rewrite)..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
-    # Replace the simple error throw with a smarter check
-    # Original: throw new LivestreamAlreadyRunningError(`Livestream for device ${serialNumber} is already running`);
-    # New: Check if stream is actually running, if not, handle stale flag
-    sed -i 's/throw new LivestreamAlreadyRunningError(`Livestream for device \${serialNumber} is already running`);/if (!station.isLiveStreaming(device)) { console.log("[eufy-ws-fix] Stale receiveLivestream flag detected for " + serialNumber + ", clearing and starting new stream"); station.startLivestream(device); if (!DeviceMessageHandler.streamingDevices[station.getSerial()]?.includes(client)) { DeviceMessageHandler.addStreamingDevice(station.getSerial(), client); } } else { throw new LivestreamAlreadyRunningError(`Livestream for device ${serialNumber} is already running`); }/' "$WS_MESSAGE_HANDLER"
+    # Use node to do the replacement - more reliable than sed for complex JS
+    node -e "
+const fs = require('fs');
+const file = '$WS_MESSAGE_HANDLER';
+let content = fs.readFileSync(file, 'utf8');
 
+// Pattern to find the else block that throws LivestreamAlreadyRunningError
+// This matches both the original code AND any previous patch attempts
+const pattern = /else\s*\{\s*(?:throw new LivestreamAlreadyRunningError|if\s*\(\s*!station\.isLiveStreaming|client\.receiveLivestream\[serialNumber\]\s*=\s*true;\s*const\s*_sn)[^}]*\}/g;
+
+// Check if we can find the startLivestream case
+if (content.includes('case DeviceCommand.startLivestream:')) {
+    // Find and replace the problematic else block
+    // We need to be more surgical - find the specific else that's the third branch
+    
+    // Strategy: Find 'else if (client.receiveLivestream[serialNumber] !== true)' and then the else after it
+    const marker = 'else if (client.receiveLivestream[serialNumber] !== true)';
+    const markerIndex = content.indexOf(marker);
+    
+    if (markerIndex !== -1) {
+        // Find the closing brace of this else-if block, then the else after it
+        let braceCount = 0;
+        let inBlock = false;
+        let elseStart = -1;
+        let elseEnd = -1;
+        
+        for (let i = markerIndex; i < content.length; i++) {
+            if (content[i] === '{') {
+                braceCount++;
+                inBlock = true;
+            } else if (content[i] === '}') {
+                braceCount--;
+                if (inBlock && braceCount === 0) {
+                    // Found end of else-if block, look for else
+                    const afterBlock = content.substring(i + 1, i + 100);
+                    const elseMatch = afterBlock.match(/^\s*else\s*\{/);
+                    if (elseMatch) {
+                        elseStart = i + 1 + afterBlock.indexOf('else');
+                        // Now find the end of the else block
+                        let elseBraceCount = 0;
+                        let inElse = false;
+                        for (let j = elseStart; j < content.length; j++) {
+                            if (content[j] === '{') {
+                                elseBraceCount++;
+                                inElse = true;
+                            } else if (content[j] === '}') {
+                                elseBraceCount--;
+                                if (inElse && elseBraceCount === 0) {
+                                    elseEnd = j + 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        
+        if (elseStart !== -1 && elseEnd !== -1) {
+            const newElseBlock = \`else {
+                    // v1.9.27: Stale flag detection - check actual stream state before throwing error
+                    if (!station.isLiveStreaming(device)) {
+                        console.log(\"[eufy-ws-fix] Stale receiveLivestream flag detected for \" + serialNumber + \", clearing and starting new stream\");
+                        station.startLivestream(device);
+                        if (!DeviceMessageHandler.streamingDevices[station.getSerial()] || !DeviceMessageHandler.streamingDevices[station.getSerial()].includes(client)) {
+                            DeviceMessageHandler.addStreamingDevice(station.getSerial(), client);
+                        }
+                    } else {
+                        throw new LivestreamAlreadyRunningError(\\\`Livestream for device \\\${serialNumber} is already running\\\`);
+                    }
+                }\`;
+            
+            content = content.substring(0, elseStart) + newElseBlock + content.substring(elseEnd);
+            fs.writeFileSync(file, content);
+            console.log('Patch applied successfully');
+            process.exit(0);
+        } else {
+            console.log('Could not find else block boundaries');
+            process.exit(1);
+        }
+    } else {
+        console.log('Could not find marker in file');
+        process.exit(1);
+    }
+} else {
+    console.log('Could not find startLivestream case');
+    process.exit(1);
+}
+"
+    
     if grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
         echo "✓ eufy-security-ws stale flag fix applied"
         rm "$WS_MESSAGE_HANDLER.bak"
     else
-        echo "✗ eufy-security-ws patch failed, trying alternative pattern..."
-        # Restore backup
+        echo "✗ eufy-security-ws patch failed"
         mv "$WS_MESSAGE_HANDLER.bak" "$WS_MESSAGE_HANDLER"
-        cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
-        
-        # Try with escaped backticks for different shell interpretations
-        sed -i "s/throw new LivestreamAlreadyRunningError(\`Livestream for device \\\${serialNumber} is already running\`);/if (!station.isLiveStreaming(device)) { console.log(\"[eufy-ws-fix] Stale receiveLivestream flag detected for \" + serialNumber + \", clearing and starting new stream\"); station.startLivestream(device); if (!DeviceMessageHandler.streamingDevices[station.getSerial()]?.includes(client)) { DeviceMessageHandler.addStreamingDevice(station.getSerial(), client); } } else { throw new LivestreamAlreadyRunningError(\`Livestream for device \${serialNumber} is already running\`); }/" "$WS_MESSAGE_HANDLER"
-        
-        if grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
-            echo "✓ eufy-security-ws stale flag fix applied (alternative pattern)"
-            rm "$WS_MESSAGE_HANDLER.bak"
-        else
-            echo "✗ eufy-security-ws patch failed completely"
-            mv "$WS_MESSAGE_HANDLER.bak" "$WS_MESSAGE_HANDLER"
-        fi
     fi
 else
     echo "⚠ eufy-security-ws message_handler.js not found at $WS_MESSAGE_HANDLER"

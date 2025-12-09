@@ -1,8 +1,8 @@
 # Eufy Security Client Runtime Patches
 
-This add-on applies runtime patches to the `eufy-security-client` npm package to fix issues and add diagnostic capabilities.
+This add-on applies runtime patches to the `eufy-security-client` npm package to fix critical issues.
 
-## Applied Patches
+## Applied Patches (v1.9.14)
 
 ### 1. Malformed P2P Packet Fix
 **Issue**: Devices occasionally send P2P packets that don't start with the expected MAGIC_WORD ("XZYH" / 0x585a5948), causing infinite loop errors.
@@ -14,23 +14,6 @@ This add-on applies runtime patches to the `eufy-security-client` npm package to
 - https://github.com/bropat/eufy-security-client/issues/537
 
 **Code Location**: `src/p2p/session.ts` - `parseDataMessage()` method
-
-**Detection Logic**:
-```typescript
-if (!firstPartMessage && this.currentMessageBuilder[message.type].header.bytesToRead === 0) {
-    // Discard packet and log details with RSSI and queue metrics
-}
-```
-
-**Diagnostic Data Logged**:
-- Station serial number
-- Sequence number
-- Data type (VIDEO/AUDIO/BINARY)
-- First 4 bytes (hex) of malformed packet
-- Data length
-- **WiFi RSSI** (signal strength)
-- **RSSI age** (milliseconds since last update)
-- **Queue size** (number of queued packets)
 
 ### 2. WiFi RSSI Tracking
 **Purpose**: Track WiFi signal strength per channel to correlate with packet drops and connection issues.
@@ -45,37 +28,53 @@ if (!firstPartMessage && this.currentMessageBuilder[message.type].header.bytesTo
 ### 3. Connection Close Diagnostics
 **Purpose**: Log when P2P connections close to help diagnose connection stability issues.
 
-**Information Logged**:
-- Station serial number
-- Whether streaming was active when connection closed
-
 **Code Location**: `src/p2p/session.ts` - `onClose()` method
 
 ### 4. Stream End Diagnostics
-**Purpose**: Log when video/audio streams end to understand why streams stop.
-
-**Information Logged**:
-- Station serial number  
-- Data type (VIDEO/AUDIO/BINARY)
-- Channel number
-- Whether stop command was sent
-- **Queued data size** (packets waiting to process)
-- **WiFi RSSI** (signal strength at stream end)
-- **RSSI age** (milliseconds since last RSSI update)
+**Purpose**: Log when video/audio streams end with context including RSSI and queue size.
 
 **Code Location**: `src/p2p/session.ts` - `endStream()` method
 
-## Use Cases
+### 5. Race Condition Detection (Debug)
+**Purpose**: Log when stream state race conditions are detected.
 
-### Diagnosing WiFi/Interference Issues
-Monitor RSSI values in malformed packet and stream ending logs:
-- RSSI < -70 dBm = Weak signal, likely cause of issues
-- rssiAge > 30000ms = RSSI not updating, possible connection problem
-- Consistent RSSI with packet drops = Not signal strength, likely interference
+**Code Location**: `src/http/station.ts` - `startLivestream()` method
 
-### Identifying Queue Buildup
-- High queueSize in malformed packet logs = Processing can't keep up
-- Growing queueSize over time = Memory leak or sustained overload
+### 6. **Livestream Stopped Event Fix** ✅ NEW in v1.9.14
+**Issue**: Cameras get stuck in "preparing" mode, unable to start streams after timeout/reconnect.
+
+**Root Cause**: 
+- `eufy-security-ws` sets `client.receiveLivestream[serialNumber] = true` when `startLivestream()` is called
+- `eufy-security-ws` only clears this flag when it receives `"livestream stopped"` event from `eufy-security-client`
+- `eufy-security-client` only emitted `"livestream stopped"` if stream received data (`!p2pStreamNotStarted`)
+- When stream times out without receiving data, the event was never emitted
+- Result: `receiveLivestream` flag stays true forever, blocking all future stream attempts
+
+**Evidence from Logs**:
+```
+15:12:27 - Stream ending { queuedDataSize: 0 }  ← No data received
+15:12:29 - LivestreamAlreadyRunningError        ← Only 2 seconds later!
+15:18:00+ - LivestreamAlreadyRunningError       ← Every 60 seconds (automation retry)
+```
+
+**Fix**: Remove the `!p2pStreamNotStarted` check in `endStream()` so the "livestream stopped" event is ALWAYS emitted (unless stream is invalid).
+
+**Code Change**:
+```javascript
+// BEFORE (buggy):
+if (!this.currentMessageState[datatype].invalidStream && !this.currentMessageState[datatype].p2pStreamNotStarted)
+    this.emitStreamStopEvent(datatype);
+
+// AFTER (fixed):
+if (!this.currentMessageState[datatype].invalidStream)
+    this.emitStreamStopEvent(datatype);
+```
+
+**Impact**: Fixes cameras stuck in "preparing" mode permanently after stream timeouts.
+
+**Related**: 
+- Fork fix: https://github.com/evertide/eufy-security-client/commit/e49f670
+- Investigation: https://github.com/evertide/eufy-security-client/blob/master/INVESTIGATION_NOTES.md
 
 ## Implementation
 
@@ -89,99 +88,30 @@ docker exec addon_82d28e79_eufy_security_ws grep -c "Discarding malformed P2P pa
 docker exec addon_82d28e79_eufy_security_ws grep -c "P2P connection closed" /usr/src/app/node_modules/eufy-security-client/build/p2p/session.js
 docker exec addon_82d28e79_eufy_security_ws grep -c "Stream ending" /usr/src/app/node_modules/eufy-security-client/build/p2p/session.js
 docker exec addon_82d28e79_eufy_security_ws grep -c "this.channelRSSI = new Map()" /usr/src/app/node_modules/eufy-security-client/build/p2p/session.js
+docker exec addon_82d28e79_eufy_security_ws grep -c "Race condition detected" /usr/src/app/node_modules/eufy-security-client/build/http/station.js
 ```
 
 Each should return `1`.
 
-## Version
+## Version History
 
-- Add-on version: 1.9.8
-- Base package: eufy-security-ws@1.9.3
-- Target library: eufy-security-client@3.5.0
+- **v1.9.14** - Added livestream stopped event fix (Issue 2)
+- **v1.9.13** - Added race condition detection logging
+- **v1.9.10-12** - WiFi RSSI tracking and diagnostics
+- **v1.9.8** - Initial malformed packet fix
 
-## Known Issues Not Patched
+## Upstream Status
 
-### Stream State Race Condition
-**Issue**: After network disruption, `LivestreamAlreadyRunningError` can occur when stream timeout and client restart execute simultaneously.
+**Issue 1 (Malformed Packets)**: ✅ Ready for upstream PR
+- Clean fix, no interface changes
+- Well tested, 100% improvement
 
-**Root Cause**: Race condition between:
-1. P2P layer calling `endStream()` due to 5-second data timeout
-2. Client (eufy-security-ws) attempting `startLivestream()` after reconnection
-3. `isLiveStreaming()` check returns false, but by the time `startLivestream()` executes, state is transitioning
-
-**Sequence**:
-```
-13:29:41.611 - endStream() called for F7C
-13:29:41.984 - ERROR: LivestreamAlreadyRunningError thrown
-```
-
-**Why Not Patched**:
-- Fix requires modifying TypeScript interface to add `p2pStreamEnding` flag
-- Runtime JavaScript patching can't modify compiled interface definitions
-- Proper fix requires upstream change in eufy-security-client
-
-**Workaround**: 
-- eufy-security-ws has retry logic that handles this error
-- After brief wait, retry succeeds as stream cleanup completes
-- Not critical since error is recoverable
-
-**Proper Fix Location**: 
-- Fork: https://github.com/evertide/eufy-security-client
-- Commit: 885bfd6 - "Fix race condition in stream state management"
-- Adds `p2pStreamEnding` boolean flag to block new streams during teardown
-
-**Upstream PR**: Prepared but held as draft per maintainer request
-
-## Investigation Results
-
-### T84A1 Wall Light Cam S100 Testing
-
-**Problem**: T84A1P1025021F7C experiencing "Infinite loop detected" errors and frequent stream dropouts.
-
-**Root Cause Confirmed**: **Weak WiFi signal** causing packet corruption at protocol level.
-
-**Evidence**:
-- Before WiFi improvement (12:50-13:01, 11 min): 420 malformed packets (38.2/min)
-- After WiFi improvement (13:25-13:30, 5 min): 0 malformed packets from F7C
-- **100% elimination** by moving camera to dedicated AP with strong signal
-
-**RSSI Findings**:
-- T84A1 cameras do NOT send `CMD_WIFI_CONFIG` messages
-- RSSI tracking shows `undefined` for these devices
-- Cannot use RSSI for real-time monitoring on T84A1
-- Other device types (doorbells, indoor cams) do send WiFi config
-
-**Recommendation**: 
-- Ensure strong WiFi coverage (-60 dBm or better) for T84A1 cameras
-- Monitor malformed packet rate as proxy for signal quality
-- Consider dedicated 2.4GHz AP on clear channel for outdoor cameras
+**Issue 2 (Livestream Stopped)**: ✅ **Fixed in v1.9.14**
+- Root cause identified and patched
+- Requires interface changes (cannot fully patch via sed)
+- Fork has complete fix: https://github.com/evertide/eufy-security-client
 
 ---
 
-****Version**: 1.9.11
+**Version**: 1.9.14  
 **Last Updated**: December 9, 2025
-
-### 5. Race Condition Detection (Debug)
-**Purpose**: Log when the stream state race condition is detected to verify if it occurs and help validate the fix.
-
-**Information Logged**:
-- Device serial number
-- Station serial number
-- Stream state when checked
-- Action taken (startLivestream blocked)
-
-**What to Look For**:
-```
-Race condition detected: Stream state check {
-  device: 'T84A1P1025021F7C',
-  station: 'T84A1P1025020FEF',
-  isStreaming: true,
-  action: 'startLivestream blocked'
-}
-```
-
-If you see this message followed immediately by `LivestreamAlreadyRunningError`, it confirms the race condition is occurring and would benefit from the `p2pStreamEnding` flag fix in the fork.
-
-**Code Location**: `src/http/station.ts` - `startLivestream()` method
-
-**Temporary**: This logging will be removed once race condition frequency is determined.

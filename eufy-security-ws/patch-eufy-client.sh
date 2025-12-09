@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fix for malformed packets with diagnostics..."
+echo "Applying P2P session.js fixes..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
@@ -88,8 +88,13 @@ sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
             rssiAge: rssiData.timestamp ? Date.now() - rssiData.timestamp : null\\
         });" "$SESSION_FILE"
 
+# FIX ISSUE 2: Always emit livestream stopped event
+# Remove the p2pStreamNotStarted check that prevents event emission
+# This ensures eufy-security-ws always gets notified to clear its receiveLivestream flag
+echo "Applying livestream stopped event fix..."
+sed -i 's/if (!this\.currentMessageState\[datatype\]\.invalidStream \&\& !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted)/if (!this.currentMessageState[datatype].invalidStream)/' "$SESSION_FILE"
+
 # Add race condition detection in startLivestream (station.js)
-# Log when we check isLiveStreaming just before potential error
 sed -i "/if (this.isLiveStreaming(device)) {/i\\
         const streamingState = this.isLiveStreaming(device);\\
         if (streamingState) {\\
@@ -133,22 +138,20 @@ if grep -q "Race condition detected" "$STATION_FILE"; then
     VERIFIED=$((VERIFIED + 1))
 fi
 
-if [ "$VERIFIED" -eq 5 ]; then
-    echo "✓ All patches verified"
+# Verify the livestream stopped fix
+if grep -q 'if (!this\.currentMessageState\[datatype\]\.invalidStream)' "$SESSION_FILE" && \
+   ! grep -q 'p2pStreamNotStarted' "$SESSION_FILE" | grep -q 'emitStreamStopEvent'; then
+    echo "✓ Livestream stopped event fix verified"
+    VERIFIED=$((VERIFIED + 1))
+fi
+
+if [ "$VERIFIED" -eq 6 ]; then
+    echo "✓ All 6 patches verified"
     rm "$SESSION_FILE.bak"
     rm "$STATION_FILE.bak"
     echo "Done!"
 else
-    echo "✗ Patch verification failed (verified $VERIFIED/5)"
-    echo "Checking what went wrong..."
-    if ! grep -q "this.channelRSSI = new Map()" "$SESSION_FILE"; then
-        echo "DEBUG: RSSI Map not found, checking constructor pattern..."
-        grep -n "constructor(rawStation" "$SESSION_FILE" | head -3
-    fi
-    if ! grep -q "Race condition detected" "$STATION_FILE"; then
-        echo "DEBUG: Race condition logging not found, checking pattern..."
-        grep -n "if (this.isLiveStreaming(device))" "$STATION_FILE" | head -3
-    fi
+    echo "✗ Patch verification failed (verified $VERIFIED/6)"
     mv "$SESSION_FILE.bak" "$SESSION_FILE"
     mv "$STATION_FILE.bak" "$STATION_FILE"
     exit 1

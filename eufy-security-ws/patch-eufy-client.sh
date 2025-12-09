@@ -6,6 +6,7 @@ echo "Applying P2P session.js fixes (v1.9.28)..."
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
 WS_MESSAGE_HANDLER="/usr/src/app/node_modules/eufy-security-ws/dist/lib/device/message_handler.js"
+WS_FORWARD_FILE="/usr/src/app/node_modules/eufy-security-ws/dist/lib/forward.js"
 
 if [ ! -f "$SESSION_FILE" ]; then
     echo "ERROR: session.js not found at $SESSION_FILE"
@@ -107,20 +108,36 @@ sed -i "/if (this.isLiveStreaming(device)) {/i\\
 sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION_FILE"
 
 # =====================================================
+# PATCH eufy-security-ws forward.js: Add device summary on connect
+# =====================================================
+if [ -f "$WS_FORWARD_FILE" ]; then
+    echo "Adding device summary logging to forward.js..."
+    cp "$WS_FORWARD_FILE" "$WS_FORWARD_FILE.bak"
+    
+    # Add logging after "station connect" event
+    sed -i '/this\.clients\.driver\.on("station connect"/,/});/{
+        /});/a\
+        // v1.9.28: Log device summary on station connect\
+        this.clients.driver.on("station connect", (station) => {\
+            const devices = [];\
+            try {\
+                station.getDevices().forEach(d => devices.push(d.getSerial()));\
+            } catch (e) {}\
+            console.log("[eufy-ws-patch] Station connected: " + station.getSerial() + " with devices: " + (devices.length > 0 ? devices.join(", ") : "none"));\
+        });
+    }' "$WS_FORWARD_FILE"
+    
+    # If the above didn't work, try a simpler approach
+    if ! grep -q "eufy-ws-patch.*Station connected" "$WS_FORWARD_FILE"; then
+        mv "$WS_FORWARD_FILE.bak" "$WS_FORWARD_FILE"
+    else
+        rm "$WS_FORWARD_FILE.bak"
+        echo "✓ Device summary logging added"
+    fi
+fi
+
+# =====================================================
 # PATCH eufy-security-ws: Fix race condition with p2pStreamEnding
-# 
-# v1.9.28: The REAL fix
-# 
-# Problem: isLiveStreaming() returns TRUE during p2pStreamEnding phase
-# even though the stream is actually ending. This causes:
-# - Branch 1 check (!isLiveStreaming) → FALSE (stream "is running")
-# - Branch 2 check (flag !== true) → FALSE (flag is true)
-# - Branch 3 → throws LivestreamAlreadyRunningError
-# 
-# Solution: In Branch 3, don't throw error. Instead:
-# - Log a warning that we detected a stale/ending stream
-# - Clear the old stream state and start a new one
-# - This handles both stale flags AND the p2pStreamEnding race
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
     echo "Patching eufy-security-ws message_handler.js (v1.9.28 - handle p2pStreamEnding race)..."
@@ -187,14 +204,12 @@ if (elseStart === -1 || elseEnd === -1) {
 
 // v1.9.28: Instead of checking isLiveStreaming (which includes p2pStreamEnding),
 // just log and start the stream. The underlying P2P layer will handle it.
-// If there's truly an active stream, startLivestream will fail naturally.
-// If the stream is ending, it will succeed after the ending completes.
 const newElseBlock = \`else {
                     // v1.9.28: Handle race condition with p2pStreamEnding
                     // We get here when: isLiveStreaming=true AND receiveLivestream[sn]=true
                     // This can happen during the p2pStreamEnding phase when stream is actually ending
                     // Instead of throwing error, try to start the stream - the P2P layer handles conflicts
-                    console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \", attempting to start new stream\");
+                    console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \" (0FEF/F7C), attempting to start new stream\");
                     try {
                         station.startLivestream(device);
                         // If we get here, stream started successfully (old one must have ended)

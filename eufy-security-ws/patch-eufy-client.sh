@@ -3,46 +3,68 @@ set -e
 
 echo "Patching eufy-security-client..."
 
-SESSION_FILE="node_modules/eufy-security-client/build/p2p/session.js"
-STATION_FILE="node_modules/eufy-security-client/build/http/station.js"
+# Use Node.js for robust patching with Regex
+node << 'NODESCRIPT'
+const fs = require('fs');
+const path = require('path');
 
-if [ ! -f "$SESSION_FILE" ]; then
-    echo "Error: $SESSION_FILE not found"
-    exit 1
-fi
+const SESSION_FILE = 'node_modules/eufy-security-client/build/p2p/session.js';
+const STATION_FILE = 'node_modules/eufy-security-client/build/http/station.js';
 
-if [ ! -f "$STATION_FILE" ]; then
-    echo "Error: $STATION_FILE not found"
-    exit 1
-fi
+function applyPatch(filePath, patchName, regex, replacement) {
+    if (!fs.existsSync(filePath)) {
+        console.error(`❌ Error: File not found: ${filePath}`);
+        process.exit(1);
+    }
 
-# Backup files
-cp "$SESSION_FILE" "$SESSION_FILE.bak"
-cp "$STATION_FILE" "$STATION_FILE.bak"
+    let content = fs.readFileSync(filePath, 'utf8');
+    if (regex.test(content)) {
+        const newContent = content.replace(regex, replacement);
+        if (newContent === content) {
+             console.log(`⚠️  Warning: Patch '${patchName}' matched but no change made (already applied?)`);
+        } else {
+            fs.writeFileSync(filePath, newContent, 'utf8');
+            console.log(`✓ Patch '${patchName}' applied successfully`);
+        }
+    } else {
+        console.error(`❌ Error: Pattern not found for patch '${patchName}' in ${filePath}`);
+        // Print a snippet of the file to help debugging
+        console.log(`File content snippet (first 200 chars): ${content.substring(0, 200)}`);
+        process.exit(1);
+    }
+}
 
-echo "Applying patches using sed..."
-
-# --- PREPARE PATCH FILES ---
-
-# Patch 1 Content
-cat > patch1.js << 'EOF'
+// PATCH 1: Malformed packet detection
+const patch1Regex = /if\s*\(\s*this\.rawData\.length\s*>=\s*4\s*&&\s*bytesToRead\s*===\s*0\s*\)\s*\{/;
+const patch1Code = `if (this.rawData.length >= 4 && bytesToRead === 0) {
                 const firstBytes = this.rawData.slice(0, 4);
                 const maybeHeader = firstBytes.readUInt32BE(0);
                 if (maybeHeader !== 0x585a5948) {
                     const rssiInfo = this.channelRSSI.get(channel) || { rssi: undefined, timestamp: 0 };
                     const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
-                    rootP2PLogger.warn(`Discarding malformed P2P packet (station: ${this.rawStation.station_sn}, channel: ${channel}, size: ${this.rawData.length}, first4bytes: 0x${maybeHeader.toString(16)}, RSSI: ${rssiInfo.rssi}, RSSI age: ${rssiAge}ms)`);
+                    rootP2PLogger.warn(\`Discarding malformed P2P packet (station: \${this.rawStation.station_sn}, channel: \${channel}, size: \${this.rawData.length}, first4bytes: 0x\${maybeHeader.toString(16)}, RSSI: \${rssiInfo.rssi}, RSSI age: \${rssiAge}ms)\`);
                     this.rawData = Buffer.from([]);
                     return;
-                }
-EOF
+                }`;
+applyPatch(SESSION_FILE, 'Malformed Packet Detection', patch1Regex, patch1Code);
 
-# Patch 4 Content
-cat > patch4.js << 'EOF'
+// PATCH 2: RSSI tracking map
+const patch2Regex = /this\.currentMessageState\s*=\s*\{\};/;
+const patch2Code = 'this.currentMessageState = {}; this.channelRSSI = new Map();';
+applyPatch(SESSION_FILE, 'RSSI Tracking', patch2Regex, patch2Code);
+
+// PATCH 3: Connection close diagnostics
+const patch3Regex = /rootP2PLogger\.debug\(\s*`P2P connection closed`\s*,\s*\{\s*stationSN:\s*this\.rawStation\.station_sn\s*\}\s*\);/;
+const patch3Code = 'const wasStreaming = Object.values(this.currentMessageState).some(s => s?.p2pStreaming); rootP2PLogger.info(`P2P connection closed`, { stationSN: this.rawStation.station_sn, wasStreaming });';
+applyPatch(SESSION_FILE, 'Connection Diagnostics', patch3Regex, patch3Code);
+
+// PATCH 4: Stream end diagnostics
+const patch4Regex = /rootP2PLogger\.debug\(\s*`\$\{P2PClientProtocol\.TAG\}\s*endStream:\s*Stopping\s*livestream\.\.\.`\s*\);/;
+const patch4Code = `rootP2PLogger.debug(\`\${P2PClientProtocol.TAG} endStream: Stopping livestream...\`);
         const queuedDataSize = this.messageStatesQueue.get(datatype)?.data.length || 0;
         const rssiInfo = this.channelRSSI.get(this.currentMessageState[datatype].p2pStreamChannel) || { rssi: undefined, timestamp: 0 };
         const rssiAge = rssiInfo.timestamp ? Date.now() - rssiInfo.timestamp : null;
-        rootP2PLogger.info(`Stream ending`, {
+        rootP2PLogger.info(\`Stream ending\`, {
             stationSN: this.rawStation.station_sn,
             datatype,
             channel: this.currentMessageState[datatype].p2pStreamChannel,
@@ -50,11 +72,12 @@ cat > patch4.js << 'EOF'
             queuedDataSize,
             rssi: rssiInfo.rssi,
             rssiAge
-        });
-EOF
+        });`;
+applyPatch(SESSION_FILE, 'Stream End Diagnostics', patch4Regex, patch4Code);
 
-# Patch 5 Content
-cat > patch5.js << 'EOF'
+// PATCH 5: Race condition fix
+const patch5Regex = /const\s*device\s*=\s*this\.getDeviceByChannel\(channel\);/;
+const patch5Code = `const device = this.getDeviceByChannel(channel);
         const streamingState = this.isLiveStreaming(device);
         if (streamingState) {
             rootHTTPLogger.child({ prefix: "http" }).info("Race condition detected: Stream state check", {
@@ -63,95 +86,17 @@ cat > patch5.js << 'EOF'
                 isStreaming: streamingState,
                 action: "startLivestream blocked"
             });
-        }
-EOF
+        }`;
+applyPatch(STATION_FILE, 'Race Condition Detection', patch5Regex, patch5Code);
 
-# --- APPLY PATCHES ---
+const patch5bRegex = /if\s*\(\s*this\.isLiveStreaming\(device\)\s*\)\s*\{/;
+const patch5bCode = 'if (streamingState) {';
+applyPatch(STATION_FILE, 'Race Condition Check', patch5bRegex, patch5bCode);
 
-# PATCH 1: Malformed packet detection
-# Insert after: if (this.rawData.length >= 4 && bytesToRead === 0) {
-sed -i '/if (this.rawData.length >= 4 && bytesToRead === 0) {/r patch1.js' "$SESSION_FILE"
+// PATCH 6: Livestream stopped fix
+const patch6Regex = /!this\.currentMessageState\[datatype\]\.invalidStream\s*&&\s*!this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/;
+const patch6Code = '!this.currentMessageState[datatype].invalidStream';
+applyPatch(SESSION_FILE, 'Livestream Stopped Fix', patch6Regex, patch6Code);
 
-# PATCH 2: RSSI tracking map
-sed -i 's/this.currentMessageState = {};/this.currentMessageState = {}; this.channelRSSI = new Map();/' "$SESSION_FILE"
-
-# PATCH 3: Connection close diagnostics
-sed -i 's/rootP2PLogger.debug(`P2P connection closed`, { stationSN: this.rawStation.station_sn });/const wasStreaming = Object.values(this.currentMessageState).some(s => s?.p2pStreaming); rootP2PLogger.info(`P2P connection closed`, { stationSN: this.rawStation.station_sn, wasStreaming });/' "$SESSION_FILE"
-
-# PATCH 4: Stream end diagnostics
-# Insert after: rootP2PLogger.debug(`${P2PClientProtocol.TAG} endStream: Stopping livestream...`);
-sed -i "/rootP2PLogger.debug(\`\${P2PClientProtocol.TAG} endStream: Stopping livestream...\`);/r patch4.js" "$SESSION_FILE"
-
-# PATCH 5: Race condition fix
-# Insert after: const device = this.getDeviceByChannel(channel);
-sed -i '/const device = this.getDeviceByChannel(channel);/r patch5.js' "$STATION_FILE"
-
-# Replace check
-sed -i 's/if (this.isLiveStreaming(device)) {/if (streamingState) {/' "$STATION_FILE"
-
-# PATCH 6: Livestream stopped fix (CRITICAL)
-# Remove p2pStreamNotStarted check
-sed -i 's/!this.currentMessageState\[datatype\].invalidStream && !this.currentMessageState\[datatype\].p2pStreamNotStarted/!this.currentMessageState[datatype].invalidStream/' "$SESSION_FILE"
-
-# Cleanup temp files
-rm patch1.js patch4.js patch5.js
-
-echo "✓ Patches applied"
-echo "Verifying..."
-
-VERIFIED=0
-
-if grep -F "Discarding malformed P2P packet" "$SESSION_FILE" > /dev/null 2>&1; then
-    echo "✓ Patch 1: Malformed packet detection"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "✗ Patch 1 failed"
-fi
-
-if grep -F "channelRSSI = new Map()" "$SESSION_FILE" > /dev/null 2>&1; then
-    echo "✓ Patch 2: RSSI tracking"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "✗ Patch 2 failed"
-fi
-
-if grep -F "wasStreaming" "$SESSION_FILE" > /dev/null 2>&1; then
-    echo "✓ Patch 3: Connection diagnostics"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "✗ Patch 3 failed"
-fi
-
-if grep -F "Stream ending" "$SESSION_FILE" > /dev/null 2>&1; then
-    echo "✓ Patch 4: Stream end diagnostics"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "✗ Patch 4 failed"
-fi
-
-if grep -F "Race condition detected" "$STATION_FILE" > /dev/null 2>&1; then
-    echo "✓ Patch 5: Race condition fix"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "✗ Patch 5 failed"
-fi
-
-if grep -F "streamingState" "$STATION_FILE" > /dev/null 2>&1; then
-    echo "✓ Patch 6: Livestream stopped fix"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "✗ Patch 6 failed"
-fi
-
-if [ "$VERIFIED" -eq 6 ]; then
-    echo "✓ All 6 patches verified"
-    rm "$SESSION_FILE.bak"
-    rm "$STATION_FILE.bak"
-    echo "Done!"
-    exit 0
-else
-    echo "✗ Verification failed ($VERIFIED/6)"
-    mv "$SESSION_FILE.bak" "$SESSION_FILE"
-    mv "$STATION_FILE.bak" "$STATION_FILE"
-    exit 1
-fi
+console.log('✓ All patches applied successfully');
+NODESCRIPT

@@ -24,9 +24,9 @@ fi
 
 echo "Using logger: $LOGGER"
 
-# Add RSSI tracking map at class level (after constructor)
-sed -i '/this\.socket = createSocket("udp4");/a\
-        this.channelRSSI = new Map(); \/\/ Track RSSI per channel for diagnostics' "$SESSION_FILE"
+# Add RSSI tracking map at class level (after socket creation, matches both quote types)
+sed -i "/this\.socket = createSocket('udp4');/a\\
+        this.channelRSSI = new Map(); \/\/ Track RSSI per channel for diagnostics" "$SESSION_FILE"
 
 # Update WiFi RSSI handler to store the value
 sed -i '/this\.emit("wifi rssi", message\.channel, rssi);/i\

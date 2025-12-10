@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fixes (v1.9.29)..."
+echo "Applying P2P session.js fixes (v1.9.30)..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
@@ -33,6 +33,12 @@ fi
 
 echo "Using logger: $LOGGER"
 
+# =====================================================
+# INCREASE STREAM DATA TIMEOUT FROM 5s TO 15s
+# =====================================================
+echo "Increasing stream data timeout from 5s to 15s..."
+sed -i 's/MAX_STREAM_DATA_WAIT = 5 \* 1000/MAX_STREAM_DATA_WAIT = 15 * 1000/' "$SESSION_FILE"
+
 # Add RSSI tracking map in constructor
 sed -i "/constructor(rawStation, api/,/^[[:space:]]*this\./ {
     /^[[:space:]]*this\./a\\
@@ -42,9 +48,12 @@ sed -i "/constructor(rawStation, api/,/^[[:space:]]*this\./ {
     n
 }" "$SESSION_FILE"
 
-# Update WiFi RSSI handler to store the value
+# Update WiFi RSSI handler to store the value AND log it
 sed -i '/this\.emit("wifi rssi", message\.channel, rssi);/i\
-                    this.channelRSSI.set(message.channel, { rssi: rssi, timestamp: Date.now() });' "$SESSION_FILE"
+                    this.channelRSSI.set(message.channel, { rssi: rssi, timestamp: Date.now() });\
+                    if (rssi < -70) {\
+                        '"${LOGGER}"'.warn("Weak WiFi signal detected", { stationSN: this.rawStation.station_sn, channel: message.channel, rssi: rssi });\
+                    }' "$SESSION_FILE"
 
 # Apply the malformed packet fix with RSSI context
 sed -i "/const firstPartMessage = data.subarray(0, 4).toString() === utils_1.MAGIC_WORD;/a\\
@@ -90,13 +99,11 @@ sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
 echo "Applying livestream stopped event fix..."
 sed -i 's/\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/.invalidStream/' "$SESSION_FILE"
 
-# NOTE: Removed station.js logging patch (v1.9.28 bug - caused .child() errors)
-
 # =====================================================
 # PATCH eufy-security-ws: Fix race condition with p2pStreamEnding
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
-    echo "Patching eufy-security-ws message_handler.js (v1.9.29 - fix p2pStreamEnding race)..."
+    echo "Patching eufy-security-ws message_handler.js (v1.9.30 - fix p2pStreamEnding race)..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
     # Use node to do the replacement
@@ -158,11 +165,11 @@ if (elseStart === -1 || elseEnd === -1) {
     process.exit(1);
 }
 
-// v1.9.29: When we detect the race condition, try to start the stream.
+// v1.9.30: When we detect the race condition, try to start the stream.
 // The P2P layer will throw LivestreamAlreadyRunningError if truly active.
 // Only rethrow if we get that specific error - other errors mean we can proceed.
 const newElseBlock = \`else {
-                    // v1.9.29: Handle race condition with p2pStreamEnding
+                    // v1.9.30: Handle race condition with p2pStreamEnding
                     // We get here when: isLiveStreaming=true AND receiveLivestream[sn]=true
                     // This can happen during p2pStreamEnding phase when stream is actually ending
                     console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \", attempting to start new stream\");
@@ -202,6 +209,14 @@ echo "Patches applied. Verifying..."
 
 VERIFIED=0
 
+# Check timeout increase
+if grep -q "MAX_STREAM_DATA_WAIT = 15 \* 1000" "$SESSION_FILE"; then
+    echo "✓ Stream data timeout increased to 15 seconds"
+    VERIFIED=$((VERIFIED + 1))
+else
+    echo "⚠ Stream data timeout may not have been increased"
+fi
+
 if grep -q "Discarding malformed P2P packet" "$SESSION_FILE"; then
     echo "✓ Malformed packet fix applied"
     VERIFIED=$((VERIFIED + 1))
@@ -214,6 +229,13 @@ if grep -q "channelRSSI" "$SESSION_FILE"; then
     VERIFIED=$((VERIFIED + 1))
 else
     echo "⚠ RSSI tracking may not have applied (continuing anyway)"
+fi
+
+if grep -q "Weak WiFi signal" "$SESSION_FILE"; then
+    echo "✓ Weak WiFi signal warning applied"
+    VERIFIED=$((VERIFIED + 1))
+else
+    echo "⚠ Weak WiFi signal warning may not have applied (continuing anyway)"
 fi
 
 if grep -q "P2P connection closed" "$SESSION_FILE"; then
@@ -246,7 +268,7 @@ else
     echo "⚠ eufy-security-ws race condition fix not applied"
 fi
 
-echo "Verified $VERIFIED/6 patches"
+echo "Verified $VERIFIED/8 patches"
 
 # Only fail if critical patch didn't apply
 if grep -q 'invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted' "$SESSION_FILE"; then

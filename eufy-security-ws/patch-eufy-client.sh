@@ -1,12 +1,11 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fixes (v1.9.28)..."
+echo "Applying P2P session.js fixes (v1.9.29)..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
 WS_MESSAGE_HANDLER="/usr/src/app/node_modules/eufy-security-ws/dist/lib/device/message_handler.js"
-WS_FORWARD_FILE="/usr/src/app/node_modules/eufy-security-ws/dist/lib/forward.js"
 
 if [ ! -f "$SESSION_FILE" ]; then
     echo "ERROR: session.js not found at $SESSION_FILE"
@@ -26,11 +25,9 @@ cp "$STATION_FILE" "$STATION_FILE.bak"
 LOGGER_REF=$(grep -o 'logging_1' "$SESSION_FILE" | head -1)
 if [ -n "$LOGGER_REF" ]; then
     LOGGER="logging_1.rootP2PLogger"
-    HTTP_LOGGER="logging_1.rootHTTPLogger"
     DATATYPE="types_1.P2PDataType"
 else
     LOGGER="rootP2PLogger"
-    HTTP_LOGGER="rootHTTPLogger"
     DATATYPE="P2PDataType"
 fi
 
@@ -93,54 +90,13 @@ sed -i "/endStream(datatype, sendStopCommand = false) {/a\\
 echo "Applying livestream stopped event fix..."
 sed -i 's/\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/.invalidStream/' "$SESSION_FILE"
 
-# Add race condition detection in startLivestream (station.js)
-sed -i "/if (this.isLiveStreaming(device)) {/i\\
-        const streamingState = this.isLiveStreaming(device);\\
-        if (streamingState) {\\
-            ${HTTP_LOGGER}.child({ prefix: \"http\" }).info(\"Race condition detected: Stream state check\", {\\
-                device: device.getSerial(),\\
-                station: this.getSerial(),\\
-                isStreaming: streamingState,\\
-                action: \"startLivestream blocked\"\\
-            });\\
-        }" "$STATION_FILE"
-
-sed -i "s/if (this\.isLiveStreaming(device)) {/if (streamingState) {/" "$STATION_FILE"
-
-# =====================================================
-# PATCH eufy-security-ws forward.js: Add device summary on connect
-# =====================================================
-if [ -f "$WS_FORWARD_FILE" ]; then
-    echo "Adding device summary logging to forward.js..."
-    cp "$WS_FORWARD_FILE" "$WS_FORWARD_FILE.bak"
-    
-    # Add logging after "station connect" event
-    sed -i '/this\.clients\.driver\.on("station connect"/,/});/{
-        /});/a\
-        // v1.9.28: Log device summary on station connect\
-        this.clients.driver.on("station connect", (station) => {\
-            const devices = [];\
-            try {\
-                station.getDevices().forEach(d => devices.push(d.getSerial()));\
-            } catch (e) {}\
-            console.log("[eufy-ws-patch] Station connected: " + station.getSerial() + " with devices: " + (devices.length > 0 ? devices.join(", ") : "none"));\
-        });
-    }' "$WS_FORWARD_FILE"
-    
-    # If the above didn't work, try a simpler approach
-    if ! grep -q "eufy-ws-patch.*Station connected" "$WS_FORWARD_FILE"; then
-        mv "$WS_FORWARD_FILE.bak" "$WS_FORWARD_FILE"
-    else
-        rm "$WS_FORWARD_FILE.bak"
-        echo "✓ Device summary logging added"
-    fi
-fi
+# NOTE: Removed station.js logging patch (v1.9.28 bug - caused .child() errors)
 
 # =====================================================
 # PATCH eufy-security-ws: Fix race condition with p2pStreamEnding
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
-    echo "Patching eufy-security-ws message_handler.js (v1.9.28 - handle p2pStreamEnding race)..."
+    echo "Patching eufy-security-ws message_handler.js (v1.9.29 - fix p2pStreamEnding race)..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
     # Use node to do the replacement
@@ -202,22 +158,27 @@ if (elseStart === -1 || elseEnd === -1) {
     process.exit(1);
 }
 
-// v1.9.28: Instead of checking isLiveStreaming (which includes p2pStreamEnding),
-// just log and start the stream. The underlying P2P layer will handle it.
+// v1.9.29: When we detect the race condition, try to start the stream.
+// The P2P layer will throw LivestreamAlreadyRunningError if truly active.
+// Only rethrow if we get that specific error - other errors mean we can proceed.
 const newElseBlock = \`else {
-                    // v1.9.28: Handle race condition with p2pStreamEnding
+                    // v1.9.29: Handle race condition with p2pStreamEnding
                     // We get here when: isLiveStreaming=true AND receiveLivestream[sn]=true
-                    // This can happen during the p2pStreamEnding phase when stream is actually ending
-                    // Instead of throwing error, try to start the stream - the P2P layer handles conflicts
-                    console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \" (0FEF/F7C), attempting to start new stream\");
+                    // This can happen during p2pStreamEnding phase when stream is actually ending
+                    console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \", attempting to start new stream\");
                     try {
                         station.startLivestream(device);
                         // If we get here, stream started successfully (old one must have ended)
                         console.log(\"[eufy-ws-fix] Successfully started new stream for \" + serialNumber);
                     } catch (e) {
-                        // If startLivestream throws, there really is an active stream
-                        console.log(\"[eufy-ws-fix] Stream truly active for \" + serialNumber + \": \" + e.message);
-                        throw new LivestreamAlreadyRunningError(\\\`Livestream for device \\\${serialNumber} is already running\\\`);
+                        // Only rethrow if it's actually a LivestreamAlreadyRunningError from P2P layer
+                        if (e.name === 'LivestreamAlreadyRunningError' || e.message.includes('already running')) {
+                            console.log(\"[eufy-ws-fix] Stream truly active for \" + serialNumber + \": \" + e.message);
+                            throw new LivestreamAlreadyRunningError(\\\`Livestream for device \\\${serialNumber} is already running\\\`);
+                        }
+                        // Other errors (like network issues) - log and rethrow original
+                        console.log(\"[eufy-ws-fix] Error starting stream for \" + serialNumber + \": \" + e.name + \" - \" + e.message);
+                        throw e;
                     }
                 }\`;
 
@@ -269,13 +230,6 @@ else
     echo "⚠ Stream end logging may not have applied (continuing anyway)"
 fi
 
-if grep -q "Race condition detected" "$STATION_FILE"; then
-    echo "✓ Race condition detection applied"
-    VERIFIED=$((VERIFIED + 1))
-else
-    echo "⚠ Race condition detection may not have applied (continuing anyway)"
-fi
-
 # CRITICAL CHECK: Verify Issue 2 fix in eufy-security-client
 if ! grep -q 'invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted' "$SESSION_FILE"; then
     echo "✓ CRITICAL: Livestream stopped event fix applied (p2pStreamNotStarted check removed)"
@@ -292,7 +246,7 @@ else
     echo "⚠ eufy-security-ws race condition fix not applied"
 fi
 
-echo "Verified $VERIFIED/7 patches"
+echo "Verified $VERIFIED/6 patches"
 
 # Only fail if critical patch didn't apply
 if grep -q 'invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted' "$SESSION_FILE"; then

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "Applying P2P session.js fixes (v1.9.30)..."
+echo "Applying P2P session.js fixes (v1.9.31)..."
 
 SESSION_FILE="/usr/src/app/node_modules/eufy-security-client/build/p2p/session.js"
 STATION_FILE="/usr/src/app/node_modules/eufy-security-client/build/http/station.js"
@@ -100,10 +100,10 @@ echo "Applying livestream stopped event fix..."
 sed -i 's/\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/.invalidStream/' "$SESSION_FILE"
 
 # =====================================================
-# PATCH eufy-security-ws: Fix race condition with p2pStreamEnding
+# PATCH eufy-security-ws: AGGRESSIVE stream reset (v1.9.31)
 # =====================================================
 if [ -f "$WS_MESSAGE_HANDLER" ]; then
-    echo "Patching eufy-security-ws message_handler.js (v1.9.30 - fix p2pStreamEnding race)..."
+    echo "Patching eufy-security-ws message_handler.js (v1.9.31 - AGGRESSIVE stream reset)..."
     cp "$WS_MESSAGE_HANDLER" "$WS_MESSAGE_HANDLER.bak"
     
     # Use node to do the replacement
@@ -165,27 +165,39 @@ if (elseStart === -1 || elseEnd === -1) {
     process.exit(1);
 }
 
-// v1.9.30: When we detect the race condition, try to start the stream.
-// The P2P layer will throw LivestreamAlreadyRunningError if truly active.
-// Only rethrow if we get that specific error - other errors mean we can proceed.
+// v1.9.31: AGGRESSIVE - Force stop the stream, wait, then start fresh
 const newElseBlock = \`else {
-                    // v1.9.30: Handle race condition with p2pStreamEnding
+                    // v1.9.31: AGGRESSIVE stream reset for stuck/stale streams
                     // We get here when: isLiveStreaming=true AND receiveLivestream[sn]=true
-                    // This can happen during p2pStreamEnding phase when stream is actually ending
-                    console.log(\"[eufy-ws-fix] Possible stale state or ending stream for \" + serialNumber + \", attempting to start new stream\");
+                    // This means we THINK stream is running but data isn't flowing
+                    // BE AGGRESSIVE: Force stop, wait for P2P to settle, then restart
+                    console.log(\"[eufy-ws-fix] v1.9.31 Stale/stuck stream detected for \" + serialNumber + \", forcing reset...\");
+                    
+                    // Step 1: Force stop the stuck stream
                     try {
+                        console.log(\"[eufy-ws-fix] Step 1: Forcing stop of stuck stream for \" + serialNumber);
+                        station.stopLivestream(device);
+                    } catch (stopErr) {
+                        // Ignore stop errors - stream might already be stopped at P2P level
+                        console.log(\"[eufy-ws-fix] Stop result for \" + serialNumber + \": \" + stopErr.message);
+                    }
+                    
+                    // Step 2: Wait for P2P state to settle
+                    console.log(\"[eufy-ws-fix] Step 2: Waiting 500ms for P2P state to settle...\");
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    
+                    // Step 3: Start fresh stream
+                    try {
+                        console.log(\"[eufy-ws-fix] Step 3: Starting fresh stream for \" + serialNumber);
                         station.startLivestream(device);
-                        // If we get here, stream started successfully (old one must have ended)
-                        console.log(\"[eufy-ws-fix] Successfully started new stream for \" + serialNumber);
-                    } catch (e) {
-                        // Only rethrow if it's actually a LivestreamAlreadyRunningError from P2P layer
-                        if (e.name === 'LivestreamAlreadyRunningError' || e.message.includes('already running')) {
-                            console.log(\"[eufy-ws-fix] Stream truly active for \" + serialNumber + \": \" + e.message);
-                            throw new LivestreamAlreadyRunningError(\\\`Livestream for device \\\${serialNumber} is already running\\\`);
-                        }
-                        // Other errors (like network issues) - log and rethrow original
-                        console.log(\"[eufy-ws-fix] Error starting stream for \" + serialNumber + \": \" + e.name + \" - \" + e.message);
-                        throw e;
+                        client.receiveLivestream[serialNumber] = true;
+                        // Note: addStreamingDevice should already have this client from earlier
+                        console.log(\"[eufy-ws-fix] Successfully restarted stream for \" + serialNumber);
+                    } catch (startErr) {
+                        console.log(\"[eufy-ws-fix] Failed to restart stream for \" + serialNumber + \": \" + startErr.message);
+                        // Reset client state since we failed
+                        client.receiveLivestream[serialNumber] = false;
+                        throw new LivestreamAlreadyRunningError(\\\`Livestream for device \\\${serialNumber} could not be restarted: \\\${startErr.message}\\\`);
                     }
                 }\`;
 
@@ -195,7 +207,7 @@ console.log('Patch applied successfully');
 "
     
     if grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
-        echo "✓ eufy-security-ws race condition fix applied"
+        echo "✓ eufy-security-ws AGGRESSIVE stream reset fix applied"
         rm "$WS_MESSAGE_HANDLER.bak"
     else
         echo "✗ eufy-security-ws patch failed"
@@ -262,10 +274,10 @@ fi
 
 # Check eufy-security-ws patch
 if [ -f "$WS_MESSAGE_HANDLER" ] && grep -q "eufy-ws-fix" "$WS_MESSAGE_HANDLER"; then
-    echo "✓ CRITICAL: eufy-security-ws race condition fix applied"
+    echo "✓ CRITICAL: eufy-security-ws AGGRESSIVE stream reset applied"
     VERIFIED=$((VERIFIED + 1))
 else
-    echo "⚠ eufy-security-ws race condition fix not applied"
+    echo "⚠ eufy-security-ws AGGRESSIVE stream reset not applied"
 fi
 
 echo "Verified $VERIFIED/8 patches"

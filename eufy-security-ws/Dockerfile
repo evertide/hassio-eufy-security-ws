@@ -15,7 +15,7 @@ RUN \
 
 # Apply P2P session.js patch for malformed packet handling
 COPY patch-eufy-client.sh /tmp/
-RUN /tmp/patch-eufy-client.sh && rm /tmp/patch-eufy-client.sh
+RUN chmod +x /tmp/patch-eufy-client.sh && /tmp/patch-eufy-client.sh && rm /tmp/patch-eufy-client.sh
 
 COPY run.sh /
 RUN chmod a+x /run.sh
